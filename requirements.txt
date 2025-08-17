@@ -1,0 +1,8 @@
+ctrader-open-api
+pyautogui
+prompt-toolkit
+twisted
+inputimeout
+python-dotenv
+rich
+colorama
