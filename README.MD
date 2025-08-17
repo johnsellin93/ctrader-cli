@@ -74,6 +74,14 @@ TOKEN_URL="https://connect.spotware.com/token"
 API_BASE_URL="https://api.spotware.com/connect/tradingaccounts"
 ```
 
+### 🔑 Where to get these values?
+
+- **CLIENT_ID / CLIENT_SECRET** — Create an app via the [cTrader Developer Portal](https://connect.spotware.com/apps)
+- **ACCESS_TOKEN / REFRESH_TOKEN** — Obtained after authorizing your app via OAuth2
+- **ACCOUNT_IDS** — Your trading account IDs (visible in cTrader once connected)
+- **TOKEN_URL / API_BASE_URL** — Use the defaults above unless Spotware changes endpoints
+
+
 ## ⌨️ Live Viewer Keybindings
 
 - `q` — quit viewer
