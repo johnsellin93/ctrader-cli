@@ -50,7 +50,7 @@ Live Unrealized PnL viewer (Rich-powered terminal UI)
 
 ## ⚙️ Setup
 
-```bash
+```
 # 1. Clone the repo
 git clone https://github.com/johnsellin93/ctrader-cli
 cd ctrader-cli
@@ -61,7 +61,7 @@ pip install -r requirements.txt
 # 3. Configure environment
 cp .env.example .env
 # then edit .env with your cTrader API keys
-
+```
 
 ## Example .env:
 ```
