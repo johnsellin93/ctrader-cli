@@ -83,14 +83,7 @@ API_BASE_URL="https://api.spotware.com/connect/tradingaccounts"
 - **TOKEN_URL / API_BASE_URL** — Use the defaults above unless Spotware changes endpoints
 
 
-## ⌨️ Live Viewer Keybindings
-
-- `q` — quit viewer
-- `j / k` — move selection down/up
-- `x` — close selected position (market close)
-- `Enter` — show details
-
-🛠️ Tech Stack
+Tech Stack
 
 - Python (3.10+)
 
