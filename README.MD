@@ -33,7 +33,6 @@ This project is a cross-platform, Python-based client for the cTrader Open API.
 
 ---
 
-## 🚀 Demo
 Live Unrealized PnL viewer (Rich-powered terminal UI)
 ![Demo](output.gif)
 
