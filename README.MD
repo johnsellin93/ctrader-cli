@@ -100,11 +100,10 @@ This project has been tested with:
 Licensed under MIT. Contributions and feature requests are welcome! 🚀
 
 
-
 ## 🎮 CLI Menu Highlights
 ```
-- List Accounts & Set Active Account
-- Show Price Board & Market Data
-- Place Market / Limit / Stop Orders
-- Live Unrealized PnL Viewer (Rich-powered terminal UI)
+- 🔑 List Accounts & Set Active Account
+- 🔍 Show Price Board & Market Data
+- 📥 Place Market / Limit / Stop Orders
+- 📊 Live Unrealized PnL Viewer (Rich-powered terminal UI)
 ```
