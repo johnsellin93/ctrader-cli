@@ -17,8 +17,7 @@ This project is a cross-platform, Python-based client for the cTrader Open API.
   - Automatic reconnect + account reconciliation
 
 - 📊 **Live Unrealized PnL Viewer**
-  - Real-time spot price subscriptions
-  - Rich-powered terminal table
+  - Browse open positions in real time using a Rich-powered table and intuitive keybindings (`j/k`, `q`, `x`).
   - Navigation: `j/k` to move, `q` to quit, `x` to close position
 
 - 📥 **Trading Actions**
@@ -84,13 +83,22 @@ Tech Stack
 
 - prompt_toolkit (CLI input)
 
-📜 License
+## 📦 Dependencies
+This project has been tested with:
+
+- ctrader-open-api==0.9.2
+- pyautogui==0.9.54
+- prompt-toolkit==3.0.51
+- twisted==24.3.0
+- inputimeout==1.0.4
+- python-dotenv==1.0.1
+- rich==13.7.0
+- colorama==0.4.6
 
 
-## 📜 License
+##  License & Contributions
+Licensed under MIT. Contributions and feature requests are welcome! 🚀
 
-This project is licensed under the MIT License — feel free to fork, modify, and use.
-Contributions, issues, and feature requests are welcome!
 
 ## 🎮 CLI Menu
 ```
