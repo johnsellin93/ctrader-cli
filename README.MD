@@ -83,7 +83,7 @@ Tech Stack
 
 - prompt_toolkit (CLI input)
 
-## 📦 Dependencies
+## Dependencies
 This project has been tested with:
 
 - ctrader-open-api==0.9.2
