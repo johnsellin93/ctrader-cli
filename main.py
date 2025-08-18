@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python
 import traceback
 from ctrader_open_api import Client, Protobuf, TcpProtocol, Auth, EndPoints
@@ -49,6 +50,10 @@ currentAccountId = None
 selected_position_index = 0
 error_messages = []
 view_offset = 0
+# ---- cached sort for positions (to avoid re-sorting on every keypress) ----
+positions_sorted_cache = []
+_positions_sorted_dirty = True
+menuScheduled = False
 
 # Configure logging
 logging.basicConfig(
@@ -127,7 +132,7 @@ if __name__ == "__main__":
 
         def onAppAuthSuccess(_):
             print("✅ Application authorized")
-            print("📥 Fetching available accounts from access token...")
+#             print("📥 Fetching available accounts from access token...")
             sendProtoOAGetAccountListByAccessTokenReq()
 
         deferred = client.send(request)
@@ -156,7 +161,7 @@ if __name__ == "__main__":
             if trader:
                 print(f" {idx}. {accId} — [{is_live}] Equity: {trader.equity / 100:.2f}, Free Margin: {trader.freeMargin / 100:.2f}, Broker: {broker}, Currency: {currency}")
             else:
-                print(f" {idx}. {accId} — [{is_live}] [No trader info available], Broker: {broker}, Currency: {currency}")
+                print(f" {idx}. {accId} — [{is_live}], Broker: {broker}, Currency: {currency}")
 
         while True:
             try:
@@ -182,15 +187,34 @@ if __name__ == "__main__":
 
 
     # ── new helper (put it near the other little utils) ────────────────
-
-
-    def ordered_positions() -> list[tuple[int]]:
-        """[(posId, pos)] sorted the same way the table shows them."""
-        return sorted(
+    
+    def mark_positions_dirty():
+        """Call this whenever PnL changes or positions are added/removed."""
+        global _positions_sorted_dirty
+        _positions_sorted_dirty = True
+    
+    def _rebuild_sorted_cache():
+        global positions_sorted_cache, _positions_sorted_dirty
+        positions_sorted_cache = sorted(
             positionsById.items(),
-            key=lambda item: positionPnLById.get(item[0], 0),
+            key=lambda item: positionPnLById.get(item[0], 0.0),
             reverse=True,
         )
+        _positions_sorted_dirty = False
+
+#     def ordered_positions() -> list[tuple[int]]:
+#         """[(posId, pos)] sorted the same way the table shows them."""
+#         return sorted(
+#             positionsById.items(),
+#             key=lambda item: positionPnLById.get(item[0], 0),
+#             reverse=True,
+#         )
+
+    def ordered_positions() -> list[tuple[int]]:
+        """[(posId, pos)] sorted by current net PnL (cached)."""
+        if _positions_sorted_dirty:
+            _rebuild_sorted_cache()
+        return positions_sorted_cache
 
 
     def buildLivePnLView():
@@ -206,6 +230,11 @@ if __name__ == "__main__":
         return Group(*pieces)                           # hand Rich real renderables
 
 
+    def format_lots(volume_units: int, with_suffix: bool = True) -> str:
+        # cTrader volume is in centi-lots (100 = 1.00 lots)
+        lots = volume_units / 100.0
+        s = f"{lots:,.2f}"
+        return f"{s} Lots" if with_suffix else s
 
     def buildLivePnLTable():
         """Return (rich.Table, last_3_error_messages) for the live PnL viewer."""
@@ -238,7 +267,7 @@ if __name__ == "__main__":
         n = len(sorted_positions)
 
         term_height = console.size.height
-        max_rows = term_height - 8
+        max_rows = max(1, term_height - 8)
 
         if n == 0:                        # no rows – show empty table
             selected_position_index = 0
@@ -257,7 +286,7 @@ if __name__ == "__main__":
         
         # NEW ↓ – work out how many rows fit and slice the data
         term_height = console.size.height
-        max_rows = term_height - 8          # same slack as above
+        max_rows = max(1, term_height - 8)
         visible = sorted_positions[view_offset : view_offset + max_rows]
         total_pnl = 0.0  
         for global_idx, (posId, pos) in enumerate(visible, start=view_offset):
@@ -279,17 +308,21 @@ if __name__ == "__main__":
                 hrs, mins     = divmod(int(held_diff.total_seconds() // 60), 60)
                 held_for      = f"{hrs}h {mins}m" if hrs else f"{mins}m"
     
-                contract_size = symbolIdToDetails.get(symbol_id, {}).get("contractSize", 1)
-                volume_lots   = pos.tradeData.volume / contract_size
+                # 1) Convert volume to lots correctly
+                volume_lots = pos.tradeData.volume / 100.0
+                
+                # 2) Still use contractSize when turning price delta into money
+                contract_size = symbolIdToDetails.get(symbol_id, {}).get("contractSize", 100000) or 100000
     
+   
+
                 entry_price   = pos.price
                 money_digits  = pos.moneyDigits or symbolIdToDetails.get(symbol_id, {}).get("pips", 2)
                 entry_price_s = f"{entry_price}"
-    
                 bid, ask      = symbolIdToPrice.get(symbol_id, (None, None))
                 market_price  = ask if side_raw == "BUY" else bid
                 market_price_s= f"{market_price}" if market_price else "[pending]"
-    
+
                 # ── NEW: live-fallback if cache empty ────────────────────────────
                 pnl_cached = positionPnLById.get(posId)
                 if isinstance(pnl_cached, (int, float)):
@@ -312,7 +345,7 @@ if __name__ == "__main__":
                     symbol_name,
                     side,
                     held_for,
-                    f"{volume_lots:.2f}",
+                    format_lots(pos.tradeData.volume, with_suffix=False),
                     entry_price_s,
                     market_price_s,
                     pnl_s,
@@ -361,16 +394,6 @@ if __name__ == "__main__":
             marketPriceLabel = "[waiting]"
             pnlLabel = "[calculating]"
 
-            if market_price is not None:
-                market_price_str = (
-                    f"{market_price}"
-                    if market_price is not None
-                    else f"{Style.DIM}⛔ N/A{Style.RESET_ALL}"
-                )
-#                 market_price_str = f"{market_price:.5f}"
-            else:
-                market_price_str = "[N/A]"
-
 
             if marketPrice is not None:
                 delta = (marketPrice - openPrice) if side == "BUY" else (openPrice - marketPrice)
@@ -394,28 +417,25 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"❌ Error displaying position: {e}")
 
+    #
 
     def add_position(pos):
-        """Add a new position and refresh the UI instantly."""
         global selected_position_index, view_offset
-        
         pos_id = pos.positionId
         positionsById[pos_id] = pos
-        
-        # subscribe to its symbol
         sendProtoOASubscribeSpotsReq(pos.tradeData.symbolId)
+        mark_positions_dirty()
+        sendProtoOAGetPositionUnrealizedPnLReq()  # get real PnL quickly
     
-        # ensure viewport is valid
-        total = len(ordered_positions())
-        if total == 1:  # first position
+        ops = ordered_positions()
+        total = len(ops)
+        if total == 1:
             selected_position_index = 0
             view_offset = 0
         elif selected_position_index >= total:
             selected_position_index = total - 1
     
-        printLivePnLTable()
-
-
+        reactor.callFromThread(printLivePnLTable)
 
     def handle_message(client, message):
         global currentAccountId
@@ -581,32 +601,57 @@ if __name__ == "__main__":
                 print("⚠️ None of the ACCOUNT_IDS from .env matched available accounts.")
                 print("Use menu option 2 to manually authorize one.")
                 returnToMenu()
+        #
 
         elif message.payloadType == ProtoOAReconcileRes().payloadType:
-            subscribeToSymbolsFromOpenPositions()
             res = Protobuf.extract(message)
             accountId = res.ctidTraderAccountId
+        
             if showStartupOutput:
                 print("🧾 Full Reconciliation Response:")
                 print(res)
+        
             if accountId in pendingReconciliations:
                 pendingReconciliations.remove(accountId)
-
-            # ✅ Track and display positions
-            if res.position:
-                for pos in res.position:
-                    positionsById[pos.positionId] = pos
-                    subscribeToSymbolsFromOpenPositions()
-                if liveViewerActive:
-                    sendProtoOAGetPositionUnrealizedPnLReq()
-                    printLivePnLTable()
-                if showStartupOutput:
-                    print(f"📌 Open Positions ({len(res.position)}):")
-                    for pos in res.position:
-                        displayPosition(pos)
-            # ✅ Active orders
+        
+            # --- build new positions dict from reconcile ---
+            new_positions = {p.positionId: p for p in getattr(res, "position", [])}
+            old_pos_ids = set(positionsById.keys())
+            new_pos_ids = set(new_positions.keys())
+            added_ids   = new_pos_ids - old_pos_ids
+            removed_ids = old_pos_ids - new_pos_ids
+            
+            # --- (un)subscribe symbols based on added/removed positions ---
+            if liveViewerActive:
+                added_symbols = {new_positions[pid].tradeData.symbolId for pid in added_ids}
+                for sid in added_symbols:
+                    if sid not in subscribedSymbols:
+                        sendProtoOASubscribeSpotsReq(sid)
+        
+        
+                # Unsubscribe: symbols no longer referenced by any position
+                # (Compute against the updated positionsById)
+                # ✅ Use the freshly reconciled set
+                remaining_symbols = {p.tradeData.symbolId for p in new_positions.values()}
+                for sid in list(subscribedSymbols):
+                    if sid not in remaining_symbols:
+                        try:
+                            sendProtoOAUnsubscribeSpotsReq(sid)
+                        finally:
+                            subscribedSymbols.discard(sid)
+            positionsById.clear()
+            positionsById.update(new_positions)
+            # --- the order of rows may change; mark cache dirty once ---
+            mark_positions_dirty()
+        
+            # --- refresh PnL + UI if viewer is active ---
+            if liveViewerActive:
+                sendProtoOAGetPositionUnrealizedPnLReq()
+                printLivePnLTable()
+        
+            # --- optional logging for orders ---
             if res.order:
-                print(f"📦 Active Orders ({len(res.order)}):")
+#                 print(f"📦 Active Orders ({len(res.order)}):")
                 for order in res.order:
                     try:
                         order_id = getattr(order, "orderId", "N/A")
@@ -619,13 +664,11 @@ if __name__ == "__main__":
                         print(f"Raw order object:\n{order}")
             else:
                 print("📦 No active orders.")
-
+        
             reactor.callLater(0.5, sendProtoOATraderReq, accountId)
-#             reactor.callLater(0.3, sendProtoOAGetPositionUnrealizedPnLReq)
-#             reactor.callLater(1.0, startPnLUpdateLoop, 1.0)  # Update every second
-
-
-
+    
+    
+    
 
 
         elif message.payloadType == ProtoOAGetTrendbarsRes().payloadType:
@@ -758,7 +801,11 @@ if __name__ == "__main__":
                         gross_usd = pnl.grossUnrealizedPnL / (10 ** money_digits)
                         total_net_pnl += net_usd
 
+
+                        prev = positionPnLById.get(pnl.positionId)
                         positionPnLById[pnl.positionId] = net_usd
+                        if prev != net_usd:
+                            mark_positions_dirty()
 
                         # Try to show symbol name
                         pos = positionsById.get(pnl.positionId)
@@ -879,7 +926,7 @@ if __name__ == "__main__":
         global availableAccounts, accountMetadata
         availableAccounts = [acc.ctidTraderAccountId for acc in res.ctidTraderAccount]
         
-        print("Available accounts:")
+#         print("Available accounts:")
         for acc in res.ctidTraderAccount:
             acc_id = acc.ctidTraderAccountId
             currency = getattr(acc, "depositCurrency", "?")
@@ -1235,7 +1282,7 @@ if __name__ == "__main__":
             return grid
 
         # create a *global* Live instance (no with-block)
-        live = Live(render(), refresh_per_second=5, screen=True)
+        live = Live(render(), refresh_per_second=20, screen=True)
         live.start()
 
         # fire off background tasks
@@ -1244,14 +1291,30 @@ if __name__ == "__main__":
         threading.Thread(target=listen_for_keys, daemon=True).start()
 #         console.print("\n[dim]🔴  q → quit j/k → move ⏎ → details[/dim]")
 
+
     def remove_position(pos_id):
         global selected_position_index, view_offset
     
         if pos_id in positionsById:
+            # get symbol for potential unsubscribe
+            symbol_id = positionsById[pos_id].tradeData.symbolId
+    
             positionsById.pop(pos_id, None)
             positionPnLById.pop(pos_id, None)
     
-            # 🔹 Adjust selection
+            # NEW: if no positions left for this symbol, unsubscribe
+            still_used = any(p.tradeData.symbolId == symbol_id for p in positionsById.values())
+            if not still_used:
+                try:
+                    sendProtoOAUnsubscribeSpotsReq(symbol_id)
+                    subscribedSymbols.discard(symbol_id)
+                except Exception:
+                    pass  # best-effort
+    
+            # NEW: table order changed
+            mark_positions_dirty()
+    
+            # selection / viewport housekeeping (unchanged)
             total = len(ordered_positions())
             if total == 0:
                 selected_position_index = 0
@@ -1259,7 +1322,6 @@ if __name__ == "__main__":
             elif selected_position_index >= total:
                 selected_position_index = total - 1
     
-            # 🔹 Ensure offset is still valid
             term_height = console.size.height
             max_rows = term_height - 8
             if selected_position_index < view_offset:
@@ -1268,89 +1330,72 @@ if __name__ == "__main__":
                 view_offset = max(0, selected_position_index - max_rows + 1)
     
             printLivePnLTable()
+    #
 
-
-    def listen_for_keys() -> None:
-        """
-        Runs in its own thread, captures single-byte keystrokes,
-        and schedules UI refreshes back on the Twisted thread.
-        """
-        global selected_position_index, liveViewerActive
+    def safe_current_selection():
+        ops = ordered_positions()
+        n = len(ops)
+        if n == 0:
+            return None
+        i = max(0, min(selected_position_index, n - 1))
+        return ops[i]
     
+    def listen_for_keys() -> None:
+        global selected_position_index, liveViewerActive
         fd = sys.stdin.fileno()
         old_settings = termios.tcgetattr(fd)
         try:
             tty.setcbreak(fd)
+    
             def move_selection(delta: int) -> None:
                 global selected_position_index, view_offset
-            
-                if not positionsById:
-                    return
-            
-                n = len(ordered_positions())   
+                ops = ordered_positions()
+                n = len(ops)
+                if n == 0:
+                    return  # ← prevents modulo-by-zero when list is briefly empty
                 selected_position_index = (selected_position_index + delta) % n
-            
-                # ── viewport maths ─────────────────────────────────────────────
-                term_height = console.size.height        # rows available in the terminal
-                max_rows    = term_height - 8            # leave room for header/footer
+                term_height = console.size.height
+                max_rows = term_height - 8
                 if selected_position_index < view_offset:
                     view_offset = selected_position_index
                 elif selected_position_index >= view_offset + max_rows:
                     view_offset = selected_position_index - max_rows + 1
-                # ───────────────────────────────────────────────────────────────
-            
                 reactor.callFromThread(printLivePnLTable)
     
-    
             while liveViewerActive:
-                key = sys.stdin.read(1)
-                print(f"Key pressed: {repr(key)} (ord: {ord(key)})")
-    
-                if key == "q":
-                    liveViewerActive = False
-                    reactor.callFromThread(live.stop)  # stop Rich screen safely
-                    print("👋 Exiting Live PnL Viewer...")
-                    reactor.callLater(0.5, executeUserCommand)
-                    break
-    
-                elif key == "j":                      # down / next row
-                    move_selection(+1)
-    
-                elif key == "k":                      # up / previous row
-                    move_selection(-1)
-                    #IFEN
-    
-                elif key == "x":
-                    try:
-                        pos_id, pos = ordered_positions()[selected_position_index]
-                        contract_size = symbolIdToDetails.get(pos.tradeData.symbolId, {}).get("contractSize", 1)
+                try:
+                    key = sys.stdin.read(1)
+                    if key == "q":
+                        liveViewerActive = False
+                        reactor.callFromThread(live.stop)
+                        print("👋 Exiting Live PnL Viewer...")
+                        reactor.callLater(0.5, executeUserCommand)
+                        break
+                    elif key == "j":
+                        move_selection(+1)
+                    elif key == "k":
+                        move_selection(-1)
+                    elif key == "x":
+                        sel = safe_current_selection()
+                        if not sel:
+                            continue
+                        pos_id, pos = sel
+                        contract_size = symbolIdToDetails.get(pos.tradeData.symbolId, {}).get("contractSize", 1) or 1
                         volume_units = pos.tradeData.volume
                         reactor.callFromThread(sendProtoOAClosePositionReq, pos_id, volume_units / 100)
-                        # 2️⃣ Optimistically remove from UI right now
                         reactor.callFromThread(remove_position, pos_id)
-
-                        # 3️⃣ Safety: Schedule a reconcile in case broker rejects it
                         reactor.callLater(2.0, lambda: runWhenReady(sendProtoOAReconcileReq, currentAccountId))
-                        print(f"🚀 Sent close request for position {pos_id} ({volume_units / contract_size} lots)")
-                    except Exception as exc:
-                        err_msg = f"❌ Error closing position {pos_id if 'pos_id' in locals() else '[unknown]'}: {exc}"
-                        print(err_msg)
-                
-                        # Log the error and traceback to file
-                        logging.error(err_msg)
-                        logging.error(traceback.format_exc())
-                elif key == "\r":                     # Enter → show details
-                    try:
-                        pos_id, pos = list(positionsById.items())[selected_position_index]
-                        # … (unchanged details printout) …
-                    except Exception as exc:
-                        print(f"❌ Error showing position: {exc}")
-    
+                    elif key == "\r":
+                        sel = safe_current_selection()
+                        if not sel:
+                            continue
+                        pos_id, pos = sel
+                        # show details...
+                except Exception as e:
+                    logging.error("Key thread error: %s\n%s", e, traceback.format_exc())
+                    # keep the loop alive
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-
-
-
 
     
 #         def waitForExit():
@@ -1389,17 +1434,13 @@ if __name__ == "__main__":
             print("\n❌ No selection made.")
 
 
-    def startPnLUpdateLoop(interval=0.1):
+    def startPnLUpdateLoop(interval=0.5):
         if not currentAccountId or currentAccountId not in authorizedAccounts:
             print("⚠️ Cannot start PnL loop – account not ready.")
             return
-
         if not liveViewerActive:
-            return  # 🛑 Stop looping if viewer is not active
-
-        subscribeToSymbolsFromOpenPositions()
+            return
         sendProtoOAGetPositionUnrealizedPnLReq()
-        subscribeToSymbolsFromOpenPositions()
         reactor.callLater(interval, startPnLUpdateLoop, interval)
 
 
@@ -1469,7 +1510,7 @@ if __name__ == "__main__":
             # 👇 Add a recurring call
             reactor.callLater(3, printUpdatedPriceBoard)
         else:
-             print("\n✅ All prices received.")
+             return None 
 
     menu = {
         "1": ("List Accounts", sendProtoOAGetAccountListByAccessTokenReq),
@@ -1575,7 +1616,7 @@ def executeUserCommand():
                     if trader:
                         print(f" {idx}. {accId} — Equity: {trader.equity / 100:.2f}, Free Margin: {trader.freeMargin / 100:.2f}")
                     else:
-                        print(f" {idx}. {accId} — [No trader info available]")
+                        print(f" {idx}. {accId}")
 
                 while True:
                     try:
@@ -1635,7 +1676,7 @@ def executeUserCommand():
                 side = input("Side (BUY/SELL): ")
                 volume = input("Volume: ")
                 price = input("Price: ")
-                runWhenReady(func, side, volume, price)
+                runWhenReady(func, symbolId, side, volume, price)
 
             elif desc == "Close Position":
                 positionId = input("Position ID: ")

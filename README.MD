@@ -30,10 +30,8 @@ Includes account management, order execution, and a live Unrealized PnL viewer p
 ---
 
 ## 🚀 Demo
-
 Live Unrealized PnL viewer (Rich-powered terminal UI)
-
-*(screenshot or GIF here would be 🔥)*
+![Demo](output.gif)
 
 ---
 
