@@ -38,16 +38,6 @@ Live Unrealized PnL viewer (Rich-powered terminal UI)
 
 ---
 
-## 📋 Prerequisites
-
-- Python **3.10+**
-- `pip` (Python package manager)
-- cTrader Open API credentials:
-  - `CLIENT_ID`
-  - `CLIENT_SECRET`
-  - `ACCESS_TOKEN`
-
----
 
 ## ⚙️ Setup
 
@@ -65,11 +55,11 @@ cp .env.example .env
 
 ## Example .env:
 ```
-CLIENT_ID=""
-CLIENT_SECRET=""
-ACCESS_TOKEN=""
-REFRESH_TOKEN=""
-ACCOUNT_IDS=""
+CLIENT_ID="your-client-id"
+CLIENT_SECRET="your-client-secret"
+ACCESS_TOKEN="your-access-token"
+REFRESH_TOKEN="your-refresh-token"
+ACCOUNT_IDS="1234567,7654321"
 TOKEN_URL="https://connect.spotware.com/token"
 API_BASE_URL="https://api.spotware.com/connect/tradingaccounts"
 ```
