@@ -86,7 +86,11 @@ Tech Stack
 
 📜 License
 
-MIT License — feel free to fork, modify, and use.
+
+## 📜 License
+
+This project is licensed under the MIT License — feel free to fork, modify, and use.
+Contributions, issues, and feature requests are welcome!
 
 ## 🎮 CLI Menu
 ```
