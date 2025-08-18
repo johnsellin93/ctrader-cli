@@ -1,8 +1,12 @@
 
-# 📈 cTrader CLI
+# 📈 cTrader OpenAPI CLI
 
-A Python-powered command-line toolkit for interacting with the **cTrader Open API**.
-Includes account management, order execution, and a live Unrealized PnL viewer powered by [Rich](https://github.com/Textualize/rich).
+A Python-powered **command-line trading toolkit** for interacting with the [cTrader Open API](https://connect.spotware.com/).
+Includes account management, order execution, and a live Unrealized PnL viewer built with [Rich](https://github.com/Textualize/rich).
+
+⚠️ **Note:** This is *not* the official cTrader CLI (Windows-only).
+This project is a cross-platform, Python-based client for the cTrader Open API.
+
 
 ---
 
@@ -53,7 +57,6 @@ Live Unrealized PnL viewer (Rich-powered terminal UI)
 git clone https://github.com/johnsellin93/ctrader-cli
 cd ctrader-cli
 
-# 2. Install dependencies
 pip install -r requirements.txt
 
 # 3. Configure environment
@@ -86,6 +89,22 @@ API_BASE_URL="https://api.spotware.com/connect/tradingaccounts"
 - `j / k` — move selection down/up
 - `x` — close selected position (market close)
 - `Enter` — show details
+
+🛠️ Tech Stack
+
+- Python (3.10+)
+
+- Twisted (async networking)
+
+- Protobuf (cTrader messages)
+
+- Rich (terminal UI)
+
+- prompt_toolkit (CLI input)
+
+📜 License
+
+MIT License — feel free to fork, modify, and use.
 
 ## 🎮 CLI Menu
 ```
