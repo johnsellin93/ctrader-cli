@@ -1,5 +1,5 @@
 
-# 📈 cTrader OpenAPI CLI
+# cTrader OpenAPI CLI
 
 A Python-powered **command-line trading toolkit** for interacting with the [cTrader Open API](https://connect.spotware.com/).
 Includes account management, order execution, and a live Unrealized PnL viewer built with [Rich](https://github.com/Textualize/rich).
@@ -10,7 +10,7 @@ This project is a cross-platform, Python-based client for the cTrader Open API.
 
 ---
 
-## ✨ Features
+## Features
 
 - 🔑 **Account Management**
   - Login with API credentials (`CLIENT_ID`, `ACCESS_TOKEN`)
