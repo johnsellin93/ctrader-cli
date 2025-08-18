@@ -48,7 +48,7 @@ cd ctrader-cli
 pip install -r requirements.txt
 
 # 3. Configure environment
-cp .env.example .env
+vim .env
 # then edit .env with your cTrader API keys
 ```
 
@@ -69,6 +69,7 @@ API_BASE_URL="https://api.spotware.com/connect/tradingaccounts"
 - **ACCESS_TOKEN / REFRESH_TOKEN** — Obtained after authorizing your app via OAuth2
 - **ACCOUNT_IDS** — Your trading account IDs (visible in cTrader once connected)
 - **TOKEN_URL / API_BASE_URL** — Use the defaults above unless Spotware changes endpoints
+
 
 
 Tech Stack
@@ -102,8 +103,7 @@ Licensed under MIT. Contributions and feature requests are welcome! 🚀
 
 ## 🎮 CLI Menu Highlights
 ```
+- 📊 Live Unrealized PnL Viewer
 - 🔑 List Accounts & Set Active Account
-- 🔍 Show Price Board & Market Data
 - 📥 Place Market / Limit / Stop Orders
-- 📊 Live Unrealized PnL Viewer (Rich-powered terminal UI)
 ```
