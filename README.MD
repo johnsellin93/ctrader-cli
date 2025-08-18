@@ -100,29 +100,11 @@ This project has been tested with:
 Licensed under MIT. Contributions and feature requests are welcome! 🚀
 
 
-## 🎮 CLI Menu
+
+## 🎮 CLI Menu Highlights
 ```
-Menu Options:
- 1. List Accounts
- 2. Set Account
- 3. Version Info
- 4. List Assets
- 5. List Asset Classes
- 6. List Symbol Categories
- 7. Show Price Board
- 8. Trader Info
- 9. Subscribe to Spot
-10. Reconcile (Show Positions)
-11. Get Trendbars
-12. Get Tick Data
-13. New Market Order
-14. New Limit Order
-15. New Stop Order
-16. Close Position
-17. Cancel Order
-18. Deal Offset List
-19. Unrealized PnL (Live Viewer)
-20. Order Details
-21. Orders by Position ID
-22. Help
+- List Accounts & Set Active Account
+- Show Price Board & Market Data
+- Place Market / Limit / Stop Orders
+- Live Unrealized PnL Viewer (Rich-powered terminal UI)
 ```
