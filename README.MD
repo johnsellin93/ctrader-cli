@@ -41,10 +41,8 @@ Live Unrealized PnL viewer (Rich-powered terminal UI)
 ## ⚙️ Setup
 
 ```
-# 1. Clone the repo
-git clone https://github.com/johnsellin93/ctrader-cli
-cd ctrader-cli
-
+git clone https://github.com/johnsellin93/ctrader-cli && \
+cd ctrader-cli && \
 pip install -r requirements.txt
 
 # 3. Configure environment
@@ -99,11 +97,3 @@ This project has been tested with:
 
 ##  License & Contributions
 Licensed under MIT. Contributions and feature requests are welcome! 🚀
-
-
-## 🎮 CLI Menu Highlights
-```
-- 📊 Live Unrealized PnL Viewer
-- 🔑 List Accounts & Set Active Account
-- 📥 Place Market / Limit / Stop Orders
-```
