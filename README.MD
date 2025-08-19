@@ -7,7 +7,6 @@ Includes account management, order execution, and a live Unrealized PnL viewer b
 ⚠️ **Note:** This is *not* the official cTrader CLI (which is Windows-only).
 This project is a Python-based client for the cTrader Open API.
 Currently tested and confirmed to work on **Linux and macOS terminals**.
-Windows users can run it reliably through **WSL** or a Linux VM.
 
 ---
 
