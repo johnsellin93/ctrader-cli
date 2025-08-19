@@ -76,13 +76,14 @@ API_BASE_URL="https://api.spotware.com/connect/tradingaccounts"
 
 
 
+
 Tech Stack
 
 - Python (3.10+)
 
 - Twisted (async networking)
 
-- Protobuf (cTrader messages)
+- Protocol Buffers (protobuf)
 
 - Rich (terminal UI)
 
