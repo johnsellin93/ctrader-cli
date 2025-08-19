@@ -230,9 +230,15 @@ if __name__ == "__main__":
         return Group(*pieces)                           # hand Rich real renderables
 
 
+#     def format_lots(volume_units: int, with_suffix: bool = True) -> str:
+#         # cTrader volume is in centi-lots (100 = 1.00 lots)
+#         lots = volume_units / 100.0
+#         s = f"{lots:,.2f}"
+#         return f"{s} Lots" if with_suffix else s
+
     def format_lots(volume_units: int, with_suffix: bool = True) -> str:
-        # cTrader volume is in centi-lots (100 = 1.00 lots)
-        lots = volume_units / 100.0
+        # Interpret volume as units; 100,000 units = 1.00 lot
+        lots = volume_units / 10000000
         s = f"{lots:,.2f}"
         return f"{s} Lots" if with_suffix else s
 
