@@ -74,7 +74,7 @@ API_BASE_URL="https://api.spotware.com/connect/tradingaccounts"
 - **ACCOUNT_IDS** — Your trading account IDs (visible in cTrader once connected)
 - **TOKEN_URL / API_BASE_URL** — Use the defaults above unless Spotware changes endpoints
 
-
+---
 
 
 Tech Stack
