@@ -437,6 +437,25 @@ if __name__ == "__main__":
     
         reactor.callFromThread(printLivePnLTable)
 
+    
+    def log_exec_event_error(res, exc: Exception):
+        """Log errors from ProtoOAExecutionEvent handling to a file for debugging."""
+        try:
+            with open("exec_event_errors.log", "a") as f:
+                f.write("\n" + "="*60 + "\n")
+                f.write("⚠️ Error handling ProtoOAExecutionEvent\n")
+                try:
+                    etype = ProtoOAExecutionType.Name(res.executionType)
+                except Exception:
+                    etype = getattr(res, "executionType", "???")
+                f.write(f"ExecutionType: {etype}\n")
+                f.write(f"OrderId: {getattr(res, 'orderId', 'N/A')}\n")
+                f.write(f"PositionId: {getattr(res, 'positionId', 'N/A')}\n\n")
+                traceback.print_exc(file=f)
+        except Exception as logfail:
+            # last resort: print to stderr so it’s not lost
+            print(f"❌ Failed to log exec_event error: {logfail}")
+
     def handle_message(client, message):
         global currentAccountId
         global receivedSpotConfirmations, expectedSpotSubscriptions
@@ -699,34 +718,46 @@ if __name__ == "__main__":
             print(f"📊 {symbolName} — Tick Price Fallback — Bid: {bid}, Ask: {ask}")
 
         #
+
         elif message.payloadType == ProtoOAExecutionEvent().payloadType:
             res = Protobuf.extract(message)
-            exec_type = res.executionType
-            print(f"📥 Execution Event: {exec_type} for Order ID {res.orderId}")
+            try:
+                exec_type = res.executionType
+                print(f"📥 Execution Event: {ProtoOAExecutionType.Name(exec_type)} for Order ID {getattr(res,'orderId','N/A')}")
         
-            if res.HasField("positionId"):
-                pos_id = res.positionId
+                if exec_type == ProtoOAExecutionType.ORDER_FILLED:
+                    print_order_filled_event(res)
         
-                # Close-like events (CLOSE_POSITION, DEAL_CANCEL, etc.)
+                    if hasattr(res, "position") and res.HasField("position"):
+                        add_position(res.position)
+                        sendProtoOAGetPositionUnrealizedPnLReq()
+                        printLivePnLTable()
+                    else:
+                        runWhenReady(sendProtoOAReconcileReq, currentAccountId)
+                        if hasattr(res, "orderId"):
+                            runWhenReady(sendProtoOAOrderDetailsReq, res.orderId)
+                    return
+        
+                # Other exec types
+                if res.HasField("positionId"):
+                    pos_id = res.positionId
+                else:
+                    pos_id = None
+        
                 close_like = {
                     ProtoOAExecutionType.CLOSE_POSITION,
                     ProtoOAExecutionType.ORDER_CANCEL,
-                    ProtoOAExecutionType.DEAL_CANCEL
+                    ProtoOAExecutionType.DEAL_CANCEL,
                 }
         
-                if exec_type in close_like:
-                    print(f"🗑 Removing closed/finished position {pos_id} due to {exec_type}")
-                    remove_position(pos_id)  # clamps index & refreshes table
-                elif exec_type == ProtoOAExecutionType.ORDER_FILLED:  # new or modified
-                    # try to fetch the position details
-                    runWhenReady(lambda: sendProtoOAReconcileReq(currentAccountId))
-                    # if the broker includes position info in the execution event:
-                    if res.HasField("position"):
-                        add_position(res.position)
+                if exec_type in close_like and pos_id:
+                    print(f"🗑 Removing position {pos_id} due to {ProtoOAExecutionType.Name(exec_type)}")
+                    remove_position(pos_id)
                 else:
-                    # For modifications or openings — just reconcile
                     runWhenReady(sendProtoOAReconcileReq, currentAccountId)
-
+        
+            except Exception as e:
+                log_exec_event_error(res, e)
 
         elif message.payloadType == 2103:
             try:
