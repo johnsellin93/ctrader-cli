@@ -48,6 +48,13 @@ pip install -r requirements.txt
 # 3. Configure environment
 vim .env
 # then edit .env with your cTrader API keys
+
+After starting the script:
+
+1. Choose **`2` → Set Account**
+   (select the trading account you want to use).
+2. Then choose **`19` → Unrealized PnL (Live Viewer)**
+   to launch the live PnL dashboard.
 ```
 
 ## Example .env:
