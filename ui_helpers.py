@@ -73,7 +73,7 @@ def colorize(amount: float) -> str:
 
 def format_lots(volume_units: int, with_suffix: bool = True) -> str:
     # Your app uses centi-lots: 100 units = 1 lot
-    lots = volume_units / 100.0
+    lots = volume_units / 10000000
     s = f"{lots:,.2f}"
     return f"{s} Lots" if with_suffix else s
 
