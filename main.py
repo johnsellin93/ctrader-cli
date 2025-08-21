@@ -31,6 +31,7 @@ import contextlib
 import threading
 from colorama import Fore, Style
 from graceful_shutdown import ShutdownManager
+import ui_helpers as H
 
 
 console = Console()
@@ -53,9 +54,9 @@ selected_position_index = 0
 error_messages = []
 view_offset = 0
 # ---- cached sort for positions (to avoid re-sorting on every keypress) ----
-positions_sorted_cache = []
-_positions_sorted_dirty = True
 menuScheduled = False
+
+H.init_ordering(positionsById, positionPnLById)
 
 # Configure logging
 logging.basicConfig(
@@ -129,34 +130,6 @@ if __name__ == "__main__":
             sendProtoOASubscribeSpotsReq(symbolId)
         reactor.callLater(15, refreshSpotPrices)
 
-
-    @contextlib.contextmanager
-    def suppress_stdout(to_file=True):
-        if to_file and liveViewerActive:
-            with open("live_pnl_stdout.log", "a") as logfile:
-                old_stdout = sys.stdout
-                old_stderr = sys.stderr
-                sys.stdout = logfile
-                sys.stderr = logfile  # Also capture errors
-                try:
-                    yield
-                finally:
-                    sys.stdout = old_stdout
-                    sys.stderr = old_stderr
-        else:
-            # Fallback to original suppression (discard output)
-            with open(os.devnull, 'w') as fnull:
-                old_stdout = sys.stdout
-                sys.stdout = fnull
-                try:
-                    yield
-                finally:
-                    sys.stdout = old_stdout
-
-    # Somewhere after symbol list or login:
-#     sendProtoOASubscribeSpotsReq(symbol.symbolId, timeInSeconds=60)
-
-
     def connected(client):
         print("\nConnected")
         request = ProtoOAApplicationAuthReq()
@@ -171,16 +144,6 @@ if __name__ == "__main__":
         deferred = client.send(request)
         deferred.addCallback(onAppAuthSuccess)
         deferred.addErrback(onError)
-
-
-#     def disconnected(client, reason): # Callback for client disconnection
-#         print("\nDisconnected: ", reason)
-
-
-#     def disconnected(client, reason):
-#         print(f"🔌 Disconnected: {reason}")
-#         print("🔁 Attempting reconnect in 5s...")
-#         reactor.callLater(5, client.startService)
 
     def disconnected(client, reason):
         print(f"🔌 Disconnected: {reason}")
@@ -215,265 +178,33 @@ if __name__ == "__main__":
             except ValueError:
                 print("Enter a number.")
 
-
-    def colorize_number(amount):
-        formatted = f"{amount:.2f}"
-        padded = f"{formatted:>10}"  # Right-align without color
-        if amount > 0:
-            return f"\033[92m{padded}\033[0m"
-        elif amount < 0:
-            return f"\033[91m{padded}\033[0m"
-        return padded
-
-
-    # ── new helper (put it near the other little utils) ────────────────
-    
-    def mark_positions_dirty():
-        """Call this whenever PnL changes or positions are added/removed."""
-        global _positions_sorted_dirty
-        _positions_sorted_dirty = True
-    
-    def _rebuild_sorted_cache():
-        global positions_sorted_cache, _positions_sorted_dirty
-        positions_sorted_cache = sorted(
-            positionsById.items(),
-            key=lambda item: positionPnLById.get(item[0], 0.0),
-            reverse=True,
-        )
-        _positions_sorted_dirty = False
-
-#     def ordered_positions() -> list[tuple[int]]:
-#         """[(posId, pos)] sorted the same way the table shows them."""
-#         return sorted(
-#             positionsById.items(),
-#             key=lambda item: positionPnLById.get(item[0], 0),
-#             reverse=True,
-#         )
-
-    def ordered_positions() -> list[tuple[int]]:
-        """[(posId, pos)] sorted by current net PnL (cached)."""
-        if _positions_sorted_dirty:
-            _rebuild_sorted_cache()
-        return positions_sorted_cache
-
-
-    def buildLivePnLView():
-        table, msg = buildLivePnLTable()                # ← unpack the tuple ✅
-    
-        pieces = [table]                                # always show main table
-        if msg:                                         # optional error footer
-            pieces.append(f"[red]⚠ {msg}[/red]")
-        pieces.append("[dim]🔴  q → quit ⏎ → View details[/dim]")
-        pieces.append("[dim]↕️  j / k → Navigate[/dim]")
-        pieces.append("[dim]❌  x → Exit selected position[/dim]")
-    
-        return Group(*pieces)                           # hand Rich real renderables
-
-
-#     def format_lots(volume_units: int, with_suffix: bool = True) -> str:
-#         # cTrader volume is in centi-lots (100 = 1.00 lots)
-#         lots = volume_units / 100.0
-#         s = f"{lots:,.2f}"
-#         return f"{s} Lots" if with_suffix else s
-
-    def format_lots(volume_units: int, with_suffix: bool = True) -> str:
-        # Interpret volume as units; 100,000 units = 1.00 lot
-        lots = volume_units / 10000000
-        s = f"{lots:,.2f}"
-        return f"{s} Lots" if with_suffix else s
-
-    def buildLivePnLTable():
-        """Return (rich.Table, last_3_error_messages) for the live PnL viewer."""
-        global liveViewerActive, selected_position_index, view_offset, error_messages
-        liveViewerActive = True
-    
-        table = Table(
-            title="📊 Live Unrealized PnL",
-            box=box.SQUARE_DOUBLE_HEAD,
-            expand=True,
-            show_lines=False,
-            padding=(0, 1),
-        )
-        table.add_column("Position ID", justify="right")
-        table.add_column("Symbol",       justify="left")
-        table.add_column("Side",         justify="center")
-        table.add_column("Held For",     justify="center")
-        table.add_column("Lot Size",     justify="right")
-        table.add_column("Entry Price",  justify="right")
-        table.add_column("Market", width=10, no_wrap=True)
-        table.add_column("PnL",          justify="right")
-    
-#         table.add_column("Market", justify="right", no_wrap=True)
-        # ── sort positions: biggest net PnL first ────────────────────────────────
-#         sorted_positions = sorted(
-#             positionsById.items(),
-#             key=lambda item: positionPnLById.get(item[0], 0),
-#             reverse=True,
-        sorted_positions = ordered_positions()
-        n = len(sorted_positions)
-
-        term_height = console.size.height
-        max_rows = max(1, term_height - 8)
-
-        if n == 0:                        # no rows – show empty table
-            selected_position_index = 0
-            view_offset = 0
-        else:
-            # if the row we were on vanished, snap to last visible row
-            if selected_position_index >= n:
-                selected_position_index = n - 1
-        
-            # make sure the viewport still includes the cursor
-            if selected_position_index < view_offset:
-                view_offset = selected_position_index
-            elif selected_position_index >= view_offset + max_rows:
-                view_offset = max(0, selected_position_index - max_rows + 1)
-
-        
-        # NEW ↓ – work out how many rows fit and slice the data
-        term_height = console.size.height
-        max_rows = max(1, term_height - 8)
-        visible = sorted_positions[view_offset : view_offset + max_rows]
-        total_pnl = 0.0  
-        for global_idx, (posId, pos) in enumerate(visible, start=view_offset):
-            try:
-                is_selected = global_idx == selected_position_index
-                # ── arrow / highlight for the selected row ───────────────────────
-                pos_id_label  = f"    ⮞ {posId}" if is_selected else str(posId)
-                row_style     = "bold on blue" if is_selected else ""
-    
-                symbol_id     = pos.tradeData.symbolId
-                symbol_name   = symbolIdToName.get(symbol_id, f"ID:{symbol_id}")
-                side_raw      = ProtoOATradeSide.Name(pos.tradeData.tradeSide)
-                side          = "[green]BUY[/green]" if side_raw == "BUY" else "[red]SELL[/red]"
-    
-                opened_at_utc = datetime.datetime.fromtimestamp(
-                    pos.tradeData.openTimestamp / 1000, tz=timezone.utc
-                )
-                held_diff     = datetime.datetime.now(timezone.utc) - opened_at_utc
-                hrs, mins     = divmod(int(held_diff.total_seconds() // 60), 60)
-                held_for      = f"{hrs}h {mins}m" if hrs else f"{mins}m"
-    
-                # 1) Convert volume to lots correctly
-                volume_lots = pos.tradeData.volume / 100.0
-                
-                # 2) Still use contractSize when turning price delta into money
-                contract_size = symbolIdToDetails.get(symbol_id, {}).get("contractSize", 100000) or 100000
-    
-   
-
-                entry_price   = pos.price
-                money_digits  = pos.moneyDigits or symbolIdToDetails.get(symbol_id, {}).get("pips", 2)
-                entry_price_s = f"{entry_price}"
-                bid, ask      = symbolIdToPrice.get(symbol_id, (None, None))
-                market_price  = ask if side_raw == "BUY" else bid
-                market_price_s= f"{market_price}" if market_price else "[pending]"
-
-                # ── NEW: live-fallback if cache empty ────────────────────────────
-                pnl_cached = positionPnLById.get(posId)
-                if isinstance(pnl_cached, (int, float)):
-                    pnl_val = pnl_cached
-                elif market_price is not None:
-                    delta   = (market_price - entry_price) if side_raw == "BUY" else \
-                              (entry_price - market_price)
-                    pnl_val = delta * volume_lots * contract_size
-                else:
-                    pnl_val = None
-    
-                if pnl_val is not None:
-                    total_pnl += pnl_val
-                    pnl_s = colorize_number(pnl_val)
-                else:
-                    pnl_s = "[N/A]"
-    
-                table.add_row(
-                    pos_id_label,
-                    symbol_name,
-                    side,
-                    held_for,
-                    format_lots(pos.tradeData.volume, with_suffix=False),
-                    entry_price_s,
-                    market_price_s,
-                    pnl_s,
-                    style=row_style,
-                )
-    
-            except Exception as e:
-                table.add_row(str(posId), "[Error]", "", "", "", "", "", str(e))
-                error_messages.append(str(e))
-                if len(error_messages) > 3:
-                    error_messages.pop(0)
-    
-        # ── total row ────────────────────────────────────────────────────────────
-        table.add_section()
-        table.add_row(
-            "", "", "", "", "", "", "[bold]TOTAL[/bold]",
-            colorize_number(total_pnl),
-        )
-    
-        return table, "\n".join(error_messages[-3:])
-
-
+    # 
     def printLivePnLTable():
-        global live
-        if live:
-            live.update(buildLivePnLView())
-
-
-
-
-
-    def displayPosition(pos):
-        try:
-            symbolId = pos.tradeData.symbolId
-            volumeLots = pos.tradeData.volume / 100.0
-            side = ProtoOATradeSide.Name(pos.tradeData.tradeSide)
-            symbolName = symbolIdToName.get(symbolId, f"ID:{symbolId}")
-            openPrice = pos.price
-            moneyDigits = pos.moneyDigits or 2
-            marginUsed = pos.usedMargin / 100.0
-            openTime = datetime.datetime.utcfromtimestamp(pos.tradeData.openTimestamp / 1000).strftime('%Y-%m-%d %H:%M:%S')
-
-            bid, ask = symbolIdToPrice.get(symbolId, (None, None))
-            marketPrice = ask if side == "BUY" else bid
-            pnl = None
-            marketPriceLabel = "[waiting]"
-            pnlLabel = "[calculating]"
-
-
-            if marketPrice is not None:
-                delta = (marketPrice - openPrice) if side == "BUY" else (openPrice - marketPrice)
-                pnl = round(delta * volumeLots * 100000, 2)
-                marketPriceLabel = f"{marketPrice}"
-                pnlLabel = f"{pnl:.2f}"
-            elif pos.positionId in positionPnLById:
-                pnl = positionPnLById[pos.positionId]
-                pnlLabel = f"{pnl:.2f} (cached)"
-                marketPriceLabel = "[unavailable]"
-
-            print(f"\n📌 Position ID: {pos.positionId}")
-            print(f"   • Symbol:       {symbolName} (ID: {symbolId})")
-            print(f"   • Side:         {side}")
-            print(f"   • Volume:       {volumeLots:.2f} lots")
-            print(f"   • Entry Price:  {openPrice}")
-            print(f"   • Market Price: {marketPriceLabel}")
-            print(f"   • PnL:          {pnlLabel}")
-            print(f"   • Margin Used:  {marginUsed:.2f}")
-            print(f"   • Open Time:    {openTime} UTC")
-        except Exception as e:
-            print(f"❌ Error displaying position: {e}")
-
-    #
+        global live, selected_position_index, view_offset
+        if not live:
+            return
+        view, selected_position_index, view_offset = H.buildLivePnLView(
+            console_height=console.size.height,
+            positions_sorted=H.ordered_positions(),
+            selected_index=selected_position_index,
+            view_offset=view_offset,
+            symbolIdToName=symbolIdToName,
+            symbolIdToDetails=symbolIdToDetails,
+            symbolIdToPrice=symbolIdToPrice,
+            positionPnLById=positionPnLById,
+            error_messages=error_messages,
+        )
+        live.update(view)
 
     def add_position(pos):
         global selected_position_index, view_offset
         pos_id = pos.positionId
         positionsById[pos_id] = pos
         sendProtoOASubscribeSpotsReq(pos.tradeData.symbolId)
-        mark_positions_dirty()
+        H.mark_positions_dirty()
         sendProtoOAGetPositionUnrealizedPnLReq()  # get real PnL quickly
     
-        ops = ordered_positions()
+        ops = H.ordered_positions()
         total = len(ops)
         if total == 1:
             selected_position_index = 0
@@ -687,7 +418,7 @@ if __name__ == "__main__":
             positionsById.clear()
             positionsById.update(new_positions)
             # --- the order of rows may change; mark cache dirty once ---
-            mark_positions_dirty()
+            H.mark_positions_dirty()
         
             # --- refresh PnL + UI if viewer is active ---
             if liveViewerActive:
@@ -721,29 +452,51 @@ if __name__ == "__main__":
             print(f"📉 {len(res.trendbar)} trendbars received.")
             returnToMenu()
 
+        #
 
         elif message.payloadType == ProtoOAGetTickDataRes().payloadType:
-            res = Protobuf.extract(message)
-            symbolId = res.symbolId
-            symbolName = symbolIdToName.get(symbolId, f"ID:{symbolId}")
-            pips = symbolIdToPips.get(symbolId, 5)
-
-            if not res.tickData:
-                print(f"⚠️ No tick data for {symbolName}")
-                return
-
-            latest = sorted(res.tickData, key=lambda x: x.timestamp, reverse=True)[0]
-            bid = latest.bid / (10 ** pips) if latest.HasField("bid") else None
-            ask = latest.ask / (10 ** pips) if latest.HasField("ask") else None
-
-            # Ensure at least one side is used
-            bid = bid or ask or 0
-            ask = ask or bid or 0
-
-            symbolIdToPrice[symbolId] = (bid, ask)
-            print(f"📊 {symbolName} — Tick Price Fallback — Bid: {bid}, Ask: {ask}")
-
-        #
+            try:
+                res = Protobuf.extract(message)
+        
+                symbolId = getattr(res, "symbolId", None)
+                if symbolId is None:
+                    print("⚠️ TickDataRes missing symbolId; ignoring this response")
+                    return
+        
+                symbolName = symbolIdToName.get(symbolId, f"ID:{symbolId}")
+                pips = symbolIdToPips.get(symbolId, 5)
+        
+                ticks = list(getattr(res, "tickData", []))
+                if not ticks:
+                    print(f"⚠️ No tick data for {symbolName}")
+                    return
+        
+                latest = max(ticks, key=lambda x: getattr(x, "timestamp", 0))
+        
+                # Proto3 presence: treat 0 as “not provided” for bid/ask
+                raw_bid = getattr(latest, "bid", 0)
+                raw_ask = getattr(latest, "ask", 0)
+        
+                bid = (raw_bid / (10 ** pips)) if raw_bid else None
+                ask = (raw_ask / (10 ** pips)) if raw_ask else None
+        
+                if bid is None and ask is None:
+                    print(f"⚠️ Latest tick has no bid/ask for {symbolName}")
+                    return
+                if bid is None:
+                    bid = ask
+                if ask is None:
+                    ask = bid
+        
+                symbolIdToPrice[symbolId] = (bid, ask)
+                print(f"📊 {symbolName} — Tick Price Fallback — Bid: {bid}, Ask: {ask}")
+        
+                if liveViewerActive:
+                    printLivePnLTable()
+        
+            except Exception as e:
+                logging.error("TickData handler error: %s", e)
+                #
 
         elif message.payloadType == ProtoOAExecutionEvent().payloadType:
             res = Protobuf.extract(message)
@@ -862,7 +615,7 @@ if __name__ == "__main__":
                         prev = positionPnLById.get(pnl.positionId)
                         positionPnLById[pnl.positionId] = net_usd
                         if prev != net_usd:
-                            mark_positions_dirty()
+                            H.mark_positions_dirty()
 
                         # Try to show symbol name
                         pos = positionsById.get(pnl.positionId)
@@ -872,15 +625,9 @@ if __name__ == "__main__":
                         else:
                             symbol_name = "[unknown]"
 
-                        def colorize(amount):
-                            if amount > 0:
-                                return f"\033[92m${amount:.2f}\033[0m"
-                            elif amount < 0:
-                                return f"\033[91m${amount:.2f}\033[0m"
-                            return f"${amount:.2f}"
 
-                        gross_label = colorize(gross_usd)
-                        net_label = colorize(net_usd)
+                        gross_label = H.colorize(gross_usd)
+                        net_label = H.colorize(net_usd)
 
 #                         print(f"📊 Position {pnl.positionId:<12} | Symbol: {symbol_name:<10} | Gross: {gross_label:>10} | Net: {net_label:>10}")
 
@@ -934,7 +681,7 @@ if __name__ == "__main__":
 
     def onMessageReceived(client, message):
         if liveViewerActive:
-            with suppress_stdout():
+            with H.suppress_stdout(liveViewerActive):
                 handle_message(client, message)
         else:
             handle_message(client, message)
@@ -1279,32 +1026,8 @@ if __name__ == "__main__":
 #         reactor.callLater(interval, startPnLUpdateLoop, interval)
 
 
-    def subscribeToSymbolsFromOpenPositions(duration=None):
-        seen = set()
-        for pos in positionsById.values():
-            symbolId = pos.tradeData.symbolId
-            if symbolId not in seen:
-                seen.add(symbolId)
-                sendProtoOASubscribeSpotsReq(symbolId, timeInSeconds=duration)
 
 
-    def unlock_keyboard_caps():
-        print("🔓 Sending CAPSLOCK toggle...")
-        pyautogui.press('capslock')  # or system-specific code
-    
-
-    def launchLivePnLViewer():
-        global liveViewerActive, live, selected_position_index
-        liveViewerActive = True
-        startPositionPolling(5.0)
-        reactor.callLater(10.0, unlock_keyboard_caps)
-        # start key-listener (it expects *no* positional args)
-#         threading.Thread(target=listen_for_keys, daemon=True).start()
-    
-        print("🔃 Subscribing to spot prices for open positions...")
-    
-        subscribeToSymbolsFromOpenPositions()
-    
         def waitUntilAllPositionPrices(callback, max_wait=1.0, check_interval=0.1):
             symbolIds = {pos.tradeData.symbolId for pos in positionsById.values()}
             attempts = int(max_wait / check_interval)
@@ -1331,7 +1054,7 @@ if __name__ == "__main__":
                 console.print("\n[dim]🔴 Press 'q' and Enter to exit viewer[/dim]")
         # 🎯 Render function
         def render():
-            table, msg = buildLivePnLTable()
+            table, msg = H.buildLivePnLTable()
             grid = Table.grid(padding=(1, 1))
             grid.add_row(table)
             if msg:
@@ -1368,11 +1091,10 @@ if __name__ == "__main__":
                 except Exception:
                     pass  # best-effort
     
-            # NEW: table order changed
-            mark_positions_dirty()
+            H.mark_positions_dirty()
     
             # selection / viewport housekeeping (unchanged)
-            total = len(ordered_positions())
+            total = len(H.ordered_positions())
             if total == 0:
                 selected_position_index = 0
                 view_offset = 0
@@ -1387,17 +1109,6 @@ if __name__ == "__main__":
                 view_offset = max(0, selected_position_index - max_rows + 1)
     
             printLivePnLTable()
-    #
-
-    def safe_current_selection():
-        ops = ordered_positions()
-        n = len(ops)
-        if n == 0:
-            return None
-        i = max(0, min(selected_position_index, n - 1))
-        return ops[i]
-    
-    #
 
     def listen_for_keys() -> None:
         global selected_position_index, liveViewerActive
@@ -1417,7 +1128,7 @@ if __name__ == "__main__":
     
             def move_selection(delta: int) -> None:
                 global selected_position_index, view_offset
-                ops = ordered_positions()
+                ops = H.ordered_positions()
                 n = len(ops)
                 if n == 0:
                     return
@@ -1450,7 +1161,7 @@ if __name__ == "__main__":
                     elif key == "k":
                         move_selection(-1)
                     elif key == "x":
-                        sel = safe_current_selection()
+                        sel = H.safe_current_selection(selected_position_index)
                         if not sel:
                             continue
                         pos_id, pos = sel
@@ -1459,7 +1170,7 @@ if __name__ == "__main__":
                         reactor.callFromThread(remove_position, pos_id)
                         reactor.callLater(2.0, lambda: runWhenReady(sendProtoOAReconcileReq, currentAccountId))
                     elif key == "\r":
-                        sel = safe_current_selection()
+                        sel = H.safe_current_selection(selected_position_index)
                         if not sel:
                             continue
                         pos_id, pos = sel
@@ -1510,7 +1221,8 @@ if __name__ == "__main__":
     
         if result:
             print(f"\n✅ You selected position: {result}")
-            sendProtoOAClosePositionReq(result)
+            volume_units = positionsById[result].tradeData.volume
+            runWhenReady(sendProtoOAClosePositionReq, result, volume_units / 100)
         else:
             print("\n❌ No selection made.")
 
@@ -1566,6 +1278,48 @@ if __name__ == "__main__":
 
 
     tickFetchQueue = set()
+
+    def subscribeToSymbolsFromOpenPositions(duration=None):
+        seen = set()
+        for pos in positionsById.values():
+            sid = pos.tradeData.symbolId
+            if sid not in seen:
+                seen.add(sid)
+                sendProtoOASubscribeSpotsReq(sid, timeInSeconds=duration)
+    
+        # Optionally kick off a one-shot tick fallback for any missing prices
+        def fetch_missing_ticks():
+            for sid in seen:
+                if sid not in symbolIdToPrice:
+                    sendProtoOAGetTickDataReq(1, "BID", sid)
+        reactor.callLater(0.5, fetch_missing_ticks)
+
+    def launchLivePnLViewer():
+        global liveViewerActive, live, selected_position_index, view_offset
+        liveViewerActive = True
+        startPositionPolling(5.0)
+#         reactor.callLater(10.0)
+    
+        print("🔃 Subscribing to spot prices for open positions...")
+        subscribeToSymbolsFromOpenPositions()
+    
+        view, selected_position_index, view_offset = H.buildLivePnLView(
+            console_height=console.size.height,
+            positions_sorted=H.ordered_positions(),
+            selected_index=selected_position_index,
+            view_offset=view_offset,
+            symbolIdToName=symbolIdToName,
+            symbolIdToDetails=symbolIdToDetails,
+            symbolIdToPrice=symbolIdToPrice,
+            positionPnLById=positionPnLById,
+            error_messages=error_messages,
+        )
+        live = Live(view, refresh_per_second=20, screen=True)
+        live.start()
+    
+        sendProtoOAGetPositionUnrealizedPnLReq()
+        startPnLUpdateLoop(0.3)
+        threading.Thread(target=listen_for_keys, daemon=True).start()
 
     def printUpdatedPriceBoard():
         print("\n📊 Updated Spot Prices:")
