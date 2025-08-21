@@ -4,6 +4,7 @@ import traceback
 from ctrader_open_api import Client, Protobuf, TcpProtocol, Auth, EndPoints
 from ctrader_open_api.endpoints import EndPoints
 from re import sub
+import select
 import logging
 import termios, tty
 import pyautogui
@@ -29,6 +30,7 @@ import sys
 import contextlib
 import threading
 from colorama import Fore, Style
+from graceful_shutdown import ShutdownManager
 
 
 console = Console()
@@ -83,8 +85,39 @@ if __name__ == "__main__":
 
     client = Client(EndPoints.PROTOBUF_LIVE_HOST if hostType.lower() == "live" else EndPoints.PROTOBUF_DEMO_HOST, EndPoints.PROTOBUF_PORT, TcpProtocol)
 
+    def _stop_live_ui():
+        global liveViewerActive, live
+        try:
+            liveViewerActive = False
+        except Exception:
+            pass
+        try:
+            if live:
+                live.stop()
+        except Exception:
+            pass
+    # Create and wire the shutdown manager
+    shutdown = ShutdownManager(
+        reactor=reactor,
+        client=client,
+        get_subscribed_symbols=lambda: list(subscribedSymbols),
+        unsubscribe_symbol=lambda sid: sendProtoOAUnsubscribeSpotsReq(sid),
+        account_logout=lambda: sendProtoOAAccountLogoutReq(),
+        stop_live_ui=_stop_live_ui,
+    )
+    shutdown.install_signal_handlers()
+    
+    # Ensure Twisted calls our cleanup on reactor shutdown as well
+    reactor.addSystemEventTrigger(
+        'before', 'shutdown',
+        lambda: shutdown.cleanup(reason='reactor-shutdown')
+    )
+
     def returnToMenu():
         global menuScheduled
+        if liveViewerActive:
+            # The live viewer owns stdin; don’t start the menu now.
+            return
         menuScheduled = False
         reactor.callLater(0, executeUserCommand)
 
@@ -144,8 +177,15 @@ if __name__ == "__main__":
 #         print("\nDisconnected: ", reason)
 
 
+#     def disconnected(client, reason):
+#         print(f"🔌 Disconnected: {reason}")
+#         print("🔁 Attempting reconnect in 5s...")
+#         reactor.callLater(5, client.startService)
+
     def disconnected(client, reason):
         print(f"🔌 Disconnected: {reason}")
+        if shutdown.shutting_down:
+            return
         print("🔁 Attempting reconnect in 5s...")
         reactor.callLater(5, client.startService)
 
@@ -482,65 +522,45 @@ if __name__ == "__main__":
         ]:
             return
 
+
+        # --- inside handle_message(...) ---
+
         elif message.payloadType == ProtoOASymbolsListRes().payloadType:
             res = Protobuf.extract(message)
             print(f"📈 Received {len(res.symbol)} symbols:")
-#             expectedSpotSubscriptions = len(res.symbol)
-            open_position_symbols = {pos.tradeData.symbolId for pos in positionsById.values()}
-            expectedSpotSubscriptions = len(open_position_symbols)
-            receivedSpotConfirmations = 0
-
-            open_position_symbols = {pos.tradeData.symbolId for pos in positionsById.values()}
-            symbol_ids = [s.symbolId for s in res.symbol]
-            symbol_ids.sort(key=lambda sid: 0 if sid in open_position_symbols else 1)
-
-            symbol_by_id = {s.symbolId: s for s in res.symbol}
-            
-            for symbolId in symbol_ids:
-                symbol = symbol_by_id[symbolId]
-                # ✅ Store pips position safely
-                symbolIdToPips[symbolId] = getattr(symbol, "pipsPosition", 5)
-
-                # ✅ Store all metadata for this symbol
-                symbolIdToDetails[symbolId] = {
-                    "name": symbol.symbolName,
-                    "pips": getattr(symbol, "pipsPosition", 5),
-                    "contractSize": getattr(symbol, "contractSize", 1.0),
-                    "assetClass": getattr(symbol, "assetClassName", "Unknown")
+        
+            # Build lookups
+            for s in res.symbol:
+                symbolIdToPips[s.symbolId] = getattr(s, "pipsPosition", 5)
+                symbolIdToDetails[s.symbolId] = {
+                    "name": s.symbolName,
+                    "pips": getattr(s, "pipsPosition", 5),
+                    "contractSize": getattr(s, "contractSize", 1.0),
+                    "assetClass": getattr(s, "assetClassName", "Unknown"),
                 }
-
-                # Optional: keep existing mappings for backward compatibility
-                symbolIdToName[symbolId] = symbol.symbolName
-
-                bid_ask = symbolIdToPrice.get(symbolId)
-                if bid_ask:
-                    bid, ask = bid_ask
-                    print(f" - {symbol.symbolName} (ID: {symbolId}) — Bid: {bid}, Ask: {ask}")
-                else:
-                    print(f" - {symbol.symbolName} (ID: {symbolId}) — Price: [pending]")
-
-            # 🔁 Batch subscribe to all spot prices (in chunks)
-            def bulkSubscribeSpots(symbolIds):
-                for sid in symbolIds:
-                    if sid not in subscribedSymbols:
-                        sendProtoOASubscribeSpotsReq(sid)
-
-            # ⏳ Spread out spot subscriptions in batches
-            batch_size = 50
-            all_symbol_ids = symbol_ids  # use sorted list
-            for i in range(0, len(all_symbol_ids), batch_size):
-                chunk = all_symbol_ids[i:i + batch_size]
-                reactor.callLater(i * 0.5, bulkSubscribeSpots, chunk)
-
-            # 🆘 Fallback: fetch tick prices for any that are still missing after a delay
+                symbolIdToName[s.symbolId] = s.symbolName
+        
+            # Only care about open-position symbols
+            open_position_symbols = {p.tradeData.symbolId for p in positionsById.values()}
+        
+            # Subscribe only to ones not already subscribed
+            new_to_sub = {sid for sid in open_position_symbols if sid not in subscribedSymbols}
+            receivedSpotConfirmations = 0
+            expectedSpotSubscriptions = len(new_to_sub)
+        
+            for sid in new_to_sub:
+                sendProtoOASubscribeSpotsReq(sid)
+        
+            # Fallback ticks only for subscribed symbols
             def fetchMissingTicks():
-                for symbolId in symbolIdToName:
-                    if symbolId not in symbolIdToPrice:
-                        sendProtoOAGetTickDataReq(1, "BID", symbolId)
-
-            reactor.callLater(0.5, fetchMissingTicks)  # slight delay before fallback
+                for sid in list(subscribedSymbols):
+                    if sid not in symbolIdToPrice:
+                        sendProtoOAGetTickDataReq(1, "BID", sid)
+        
+            reactor.callLater(0.5, fetchMissingTicks)
             reactor.callLater(1.0, printUpdatedPriceBoard)
             returnToMenu()
+            return  
 
         elif message.payloadType == ProtoOASpotEvent().payloadType:
             try:
@@ -1377,10 +1397,21 @@ if __name__ == "__main__":
         i = max(0, min(selected_position_index, n - 1))
         return ops[i]
     
+    #
+
     def listen_for_keys() -> None:
         global selected_position_index, liveViewerActive
-        fd = sys.stdin.fileno()
+    
+        # Prefer the controlling TTY so we don't compete with input()/inputimeout()
+        try:
+            tty_in = open('/dev/tty', 'rb', buffering=0)
+        except Exception:
+            tty_in = sys.stdin  # fallback if /dev/tty is unavailable (e.g., some containers)
+    
+        fd = tty_in.fileno()
         old_settings = termios.tcgetattr(fd)
+        shutdown.set_tty_old_settings(old_settings)
+    
         try:
             tty.setcbreak(fd)
     
@@ -1389,7 +1420,7 @@ if __name__ == "__main__":
                 ops = ordered_positions()
                 n = len(ops)
                 if n == 0:
-                    return  # ← prevents modulo-by-zero when list is briefly empty
+                    return
                 selected_position_index = (selected_position_index + delta) % n
                 term_height = console.size.height
                 max_rows = term_height - 8
@@ -1401,10 +1432,16 @@ if __name__ == "__main__":
     
             while liveViewerActive:
                 try:
-                    key = sys.stdin.read(1)
+                    r, _, _ = select.select([tty_in], [], [], 0.1)  # 100ms poll
+                    if not r:
+                        continue
+                    b = tty_in.read(1)
+                    if not b:
+                        continue
+                    key = b.decode('utf-8', errors='ignore')
                     if key == "q":
                         liveViewerActive = False
-                        reactor.callFromThread(live.stop)
+                        reactor.callFromThread(getattr(live, "stop", lambda: None))
                         print("👋 Exiting Live PnL Viewer...")
                         reactor.callLater(0.5, executeUserCommand)
                         break
@@ -1417,7 +1454,6 @@ if __name__ == "__main__":
                         if not sel:
                             continue
                         pos_id, pos = sel
-                        contract_size = symbolIdToDetails.get(pos.tradeData.symbolId, {}).get("contractSize", 1) or 1
                         volume_units = pos.tradeData.volume
                         reactor.callFromThread(sendProtoOAClosePositionReq, pos_id, volume_units / 100)
                         reactor.callFromThread(remove_position, pos_id)
@@ -1432,8 +1468,16 @@ if __name__ == "__main__":
                     logging.error("Key thread error: %s\n%s", e, traceback.format_exc())
                     # keep the loop alive
         finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            finally:
+                shutdown.clear_tty_old_settings()
+                # close the dedicated TTY handle if we opened it
+                try:
+                    if tty_in is not sys.stdin:
+                        tty_in.close()
+                except Exception:
+                    pass
     
 #         def waitForExit():
 #             global selectedPositionIndex
@@ -1527,7 +1571,9 @@ if __name__ == "__main__":
         print("\n📊 Updated Spot Prices:")
         missing = []
     
-        for symbolId, name in symbolIdToName.items():
+        # show only the symbols we're actually subscribed to
+        for symbolId in sorted(subscribedSymbols):
+            name = symbolIdToName.get(symbolId, f"ID:{symbolId}")
             bid_ask = symbolIdToPrice.get(symbolId)
             if bid_ask:
                 bid, ask = bid_ask
@@ -1544,10 +1590,9 @@ if __name__ == "__main__":
             print(f"\n⏳ Retrying {len(missing)} missing prices...")
             for i, sid in enumerate(missing):
                 reactor.callLater(i * 0.05, sendProtoOAGetTickDataReq, 1, "BID", sid)
-            # 👇 Add a recurring call
             reactor.callLater(3, printUpdatedPriceBoard)
         else:
-             return None 
+            return None
 
     menu = {
         "1": ("List Accounts", sendProtoOAGetAccountListByAccessTokenReq),
@@ -1615,6 +1660,10 @@ def runWhenReady(fn, *args, **kwargs):
 
 def executeUserCommand():
     global menuScheduled
+    if liveViewerActive:
+        # Safety: never prompt while viewer is active
+        menuScheduled = False
+        return
     if menuScheduled:
         return  # 👈 Prevent multiple overlapping menu renderings
     menuScheduled = True
