@@ -237,7 +237,7 @@ def buildLivePnLView(
     pieces = [table]
     if msg:
         pieces.append(f"[red]⚠ {msg}[/red]")
-    pieces.append("[dim]🔴  q → quit ⏎ → View details[/dim]")
+    pieces.append("[dim]🔴  q → quit ⏎[/dim]")
     pieces.append("[dim]↕️  j / k → Navigate[/dim]")
     pieces.append("[dim]❌  x → Exit selected position[/dim]")
     return Group(*pieces), selected_index, view_offset
