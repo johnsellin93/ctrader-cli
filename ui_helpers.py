@@ -117,22 +117,24 @@ def buildLivePnLTable(
     Build and return (rich.Table, msg, selected_index, view_offset).
     Pure: no module globals.
     """
-
     table = Table(
         title="📊 Live Unrealized PnL",
         box=box.SQUARE_DOUBLE_HEAD,
         expand=True,
         show_lines=False,
-        padding=(0, 1),
+        padding=(0, 0),    # no inner padding
+        pad_edge=False,    # no outer gutter padding
     )
-    table.add_column("Position ID", justify="right")
-    table.add_column("Symbol",       justify="left")
-    table.add_column("Side",         justify="center")
-    table.add_column("Held For",     justify="center")
-    table.add_column("Lot Size",     justify="right")
-    table.add_column("Entry Price",  justify="right")
-    table.add_column("Market",       width=10, no_wrap=True)
-    table.add_column("PnL",          justify="right")
+    
+    # Position ID flexes
+    table.add_column("Position ID", justify="left"),
+    table.add_column("Symbol",      justify="center",   no_wrap=True, ratio=None, overflow="ellipsis")
+    table.add_column("Side",        justify="center", no_wrap=True, ratio=None)
+    table.add_column("Held For",    justify="center", no_wrap=True, ratio=None)
+    table.add_column("Lot Size",    justify="center",  no_wrap=True, ratio=None)
+    table.add_column("Entry Price", justify="center",  no_wrap=True, ratio=None)
+    table.add_column("Market",      justify="center",  no_wrap=True, ratio=None)
+    table.add_column("PnL",         justify="right",  no_wrap=True, ratio=None)
 
     n = len(positions_sorted)
     max_rows = max(1, console_height - 8)
