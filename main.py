@@ -2,6 +2,8 @@
 #!/usr/bin/env python
 import traceback
 from ctrader_open_api import Client, Protobuf, TcpProtocol, Auth, EndPoints
+
+from types import SimpleNamespace  # (you already have this import)
 from ctrader_open_api.endpoints import EndPoints
 from re import sub
 import select
@@ -32,9 +34,9 @@ import threading
 from colorama import Fore, Style
 from graceful_shutdown import ShutdownManager
 import ui_helpers as H
+from message_handlers import dispatch_message
 
-
-console = Console()
+console = Console(emoji=False)
 live = None
 accountMetadata = {}
 pendingReconciliations = set()
@@ -53,9 +55,22 @@ currentAccountId = None
 selected_position_index = 0
 error_messages = []
 view_offset = 0
+#
+
+RENDER_MIN_INTERVAL = 0.02
+_last_render = 0.0
+_render_pending = False
+
+#
+
 # ---- cached sort for positions (to avoid re-sorting on every keypress) ----
 menuScheduled = False
-
+slByPositionId = {}            # positionId -> SL in account currency
+slInput = {                    # inline input state
+    "mode": "idle",            # idle | armed | typing
+    "positionId": None,
+    "buffer": ""
+}
 H.init_ordering(positionsById, positionPnLById)
 
 # Configure logging
@@ -97,6 +112,15 @@ if __name__ == "__main__":
                 live.stop()
         except Exception:
             pass
+
+    # main.py
+    def get_account_ccy() -> str:
+        ccy = accountMetadata.get(currentAccountId, {}).get("currency")
+        # treat unknowns as missing and fall back to USD
+        if not ccy or ccy in {"?", "UNKNOWN", "N/A", ""}:
+            return "USD"
+        return ccy
+
     # Create and wire the shutdown manager
     shutdown = ShutdownManager(
         reactor=reactor,
@@ -178,11 +202,32 @@ if __name__ == "__main__":
             except ValueError:
                 print("Enter a number.")
 
-    # 
+    #
+
+    def _request_render():
+        global _render_pending
+        if _render_pending:
+            return
+        _render_pending = True
+        reactor.callLater(0, _do_render)
+    
+    def _do_render():
+        global _render_pending
+        _render_pending = False
+        printLivePnLTable()
+
     def printLivePnLTable():
-        global live, selected_position_index, view_offset
+        global live, selected_position_index, view_offset, _last_render 
         if not live:
             return
+
+        prompt_line = ""
+        if slInput["mode"] == "armed":
+            pid = slInput["positionId"]
+            prompt_line = f"SL for Position {pid} [{get_account_ccy()}]: (type a number, Enter=save, Esc=cancel) — j/k moves target"
+        elif slInput["mode"] == "typing":
+            pid = slInput["positionId"]
+            prompt_line = f"SL for Position {pid} [{get_account_ccy()}]: {slInput['buffer']}_  (Enter=save, Esc=cancel, ⌫=backspace)"
         view, selected_position_index, view_offset = H.buildLivePnLView(
             console_height=console.size.height,
             positions_sorted=H.ordered_positions(),
@@ -193,16 +238,38 @@ if __name__ == "__main__":
             symbolIdToPrice=symbolIdToPrice,
             positionPnLById=positionPnLById,
             error_messages=error_messages,
+            slByPositionId=slByPositionId,              
+            account_currency=get_account_ccy(),            
+            footer_prompt=prompt_line,   # <- fix
         )
-        live.update(view)
+#         live.update(view)
+        live.update(view, refresh=True)   # instead of just live.update(view)
+
+
+    def _update_pnl_cache_for_symbol(symbol_id: int):
+        bid, ask = symbolIdToPrice.get(symbol_id, (None, None))
+        if bid is None or ask is None:
+            return
+        contract_size = (symbolIdToDetails.get(symbol_id, {}) or {}).get("contractSize", 100000) or 100000
+        for pos_id, pos in positionsById.items():
+            if pos.tradeData.symbolId != symbol_id:
+                continue
+            side = H.trade_side_name(pos.tradeData.tradeSide)
+            entry = pos.price
+            lots = pos.tradeData.volume / 100.0
+            mkt = bid if side == "BUY" else ask
+            positionPnLById[pos_id] = (mkt - entry if side == "BUY" else entry - mkt) * lots * contract_size
+        H.mark_positions_dirty()
+
 
     def add_position(pos):
         global selected_position_index, view_offset
         pos_id = pos.positionId
+        slByPositionId.setdefault(pos_id, None) 
         positionsById[pos_id] = pos
         sendProtoOASubscribeSpotsReq(pos.tradeData.symbolId)
         H.mark_positions_dirty()
-        sendProtoOAGetPositionUnrealizedPnLReq()  # get real PnL quickly
+        sendProtoOAGetPositionUnrealizedPnLReq()  # get real PnL 
     
         ops = H.ordered_positions()
         total = len(ops)
@@ -233,459 +300,6 @@ if __name__ == "__main__":
             # last resort: print to stderr so it’s not lost
             print(f"❌ Failed to log exec_event error: {logfail}")
 
-    def handle_message(client, message):
-        global currentAccountId
-        global receivedSpotConfirmations, expectedSpotSubscriptions
-#         print(f"📩 Message received — payloadType: {message.payloadType}, size: {len(message.payload)} bytes")
-        if message.payloadType == ProtoOASubscribeSpotsRes().payloadType:
-            res = Protobuf.extract(message)
-            print(f"✅ Spot subscription confirmed: {res}")
-            receivedSpotConfirmations += 1
-            # When all subs are confirmed, kick off the board loop
-            if receivedSpotConfirmations >= expectedSpotSubscriptions:
-                print("✅ All spot subscriptions confirmed. Starting price board loop.")
-                reactor.callLater(0.5, printUpdatedPriceBoard)
-            return
-
-        elif message.payloadType in [
-            ProtoOAAccountLogoutRes().payloadType,
-            ProtoHeartbeatEvent().payloadType
-        ]:
-            return
-
-
-        # --- inside handle_message(...) ---
-
-        elif message.payloadType == ProtoOASymbolsListRes().payloadType:
-            res = Protobuf.extract(message)
-            print(f"📈 Received {len(res.symbol)} symbols:")
-        
-            # Build lookups
-            for s in res.symbol:
-                symbolIdToPips[s.symbolId] = getattr(s, "pipsPosition", 5)
-                symbolIdToDetails[s.symbolId] = {
-                    "name": s.symbolName,
-                    "pips": getattr(s, "pipsPosition", 5),
-                    "contractSize": getattr(s, "contractSize", 1.0),
-                    "assetClass": getattr(s, "assetClassName", "Unknown"),
-                }
-                symbolIdToName[s.symbolId] = s.symbolName
-        
-            # Only care about open-position symbols
-            open_position_symbols = {p.tradeData.symbolId for p in positionsById.values()}
-        
-            # Subscribe only to ones not already subscribed
-            new_to_sub = {sid for sid in open_position_symbols if sid not in subscribedSymbols}
-            receivedSpotConfirmations = 0
-            expectedSpotSubscriptions = len(new_to_sub)
-        
-            for sid in new_to_sub:
-                sendProtoOASubscribeSpotsReq(sid)
-        
-            # Fallback ticks only for subscribed symbols
-            def fetchMissingTicks():
-                for sid in list(subscribedSymbols):
-                    if sid not in symbolIdToPrice:
-                        sendProtoOAGetTickDataReq(1, "BID", sid)
-        
-            reactor.callLater(0.5, fetchMissingTicks)
-            reactor.callLater(1.0, printUpdatedPriceBoard)
-            returnToMenu()
-            return  
-
-        elif message.payloadType == ProtoOASpotEvent().payloadType:
-            try:
-                res = Protobuf.extract(message)
-                symbolId = res.symbolId
-                pips = symbolIdToPips.get(symbolId, 5)
-                bid = res.bid / (10 ** pips)
-                ask = res.ask / (10 ** pips)
-
-                # Update price map
-                symbolIdToPrice[symbolId] = (bid, ask)
-                for pos in positionsById.values():
-                    if pos.tradeData.symbolId != symbolId:
-                        continue
-                    # Optionally trigger UI updates per-position here if needed
-
-                # Redraw the table if live viewer is active
-                if liveViewerActive:
-                    printLivePnLTable()
-
-            except Exception as e:
-                print(f"❌ Failed to parse SpotEvent: {e}")
-
-
-        elif message.payloadType == ProtoOAAssetListRes().payloadType:
-            res = Protobuf.extract(message)
-            print(f"📊 Received {len(res.asset)} assets:")
-            for asset in res.asset[:5]:  # Just show a few
-                print(f" - {asset.name} ({asset.assetId})")
-            returnToMenu()
-        elif message.payloadType == ProtoOAVersionRes().payloadType:
-            res = Protobuf.extract(message)
-            print(f"🔧 Version Info: {res.version}")
-            returnToMenu()
-
-
-        elif message.payloadType == 2101:
-            try:
-                res = Protobuf.extract(message)
-                print("📦 Full decoded 2101 message:\n", res)
-
-                print("\n🔍 Fields in 2101 message (set fields):")
-                for field in res.ListFields():
-                    print(f" - {field[0].name}: {field[1]}")
-
-                print("\n🧬 All possible fields (even if unset):")
-                for descriptor in res.DESCRIPTOR.fields:
-                    field_name = descriptor.name
-                    if res.HasField(field_name):
-                        value = getattr(res, field_name)
-                        print(f" - {field_name}: {value}")
-                    else:
-                        print(f" - {field_name}: [not set]")
-
-            except Exception as e:
-                print(f"⚠️ Could not decode payloadType 2101: {e}")
-                print("📦 Raw payload (hex):", message.payload.hex())
-
-        elif message.payloadType == ProtoOAAssetClassListRes().payloadType:
-            res = Protobuf.extract(message)
-            print(f"🏷️ Asset Classes: {len(res.assetClass)} found.")
-            returnToMenu()
-
-        elif message.payloadType == ProtoOASymbolCategoryListRes().payloadType:
-            res = Protobuf.extract(message)
-            print(f"🗂️ Symbol Categories: {len(res.category)}")
-            returnToMenu()
-
-        elif message.payloadType == ProtoOAGetAccountListByAccessTokenRes().payloadType:
-            res = Protobuf.extract(message)
-            onAccountListReceived(res)
-
-            apiAccountIds = [acc.ctidTraderAccountId for acc in res.ctidTraderAccount]
-            validAccounts = list(set(envAccountIds) & set(apiAccountIds))
-
-            if validAccounts:
-                print("✅ Valid accounts from .env matched the API response:")
-                for accId in validAccounts:
-                    print(f" - {accId}")
-                    if accId not in authorizedAccounts:
-                        fetchTraderInfo(accId)  # ✅ Correct function
-            else:
-                print("⚠️ None of the ACCOUNT_IDS from .env matched available accounts.")
-                print("Use menu option 2 to manually authorize one.")
-                returnToMenu()
-        #
-
-        elif message.payloadType == ProtoOAReconcileRes().payloadType:
-            res = Protobuf.extract(message)
-            accountId = res.ctidTraderAccountId
-        
-            if showStartupOutput:
-                print("🧾 Full Reconciliation Response:")
-                print(res)
-        
-            if accountId in pendingReconciliations:
-                pendingReconciliations.remove(accountId)
-        
-            # --- build new positions dict from reconcile ---
-            new_positions = {p.positionId: p for p in getattr(res, "position", [])}
-            old_pos_ids = set(positionsById.keys())
-            new_pos_ids = set(new_positions.keys())
-            added_ids   = new_pos_ids - old_pos_ids
-            removed_ids = old_pos_ids - new_pos_ids
-            
-            # --- (un)subscribe symbols based on added/removed positions ---
-            if liveViewerActive:
-                added_symbols = {new_positions[pid].tradeData.symbolId for pid in added_ids}
-                for sid in added_symbols:
-                    if sid not in subscribedSymbols:
-                        sendProtoOASubscribeSpotsReq(sid)
-        
-        
-                # Unsubscribe: symbols no longer referenced by any position
-                # (Compute against the updated positionsById)
-                # ✅ Use the freshly reconciled set
-                remaining_symbols = {p.tradeData.symbolId for p in new_positions.values()}
-                for sid in list(subscribedSymbols):
-                    if sid not in remaining_symbols:
-                        try:
-                            sendProtoOAUnsubscribeSpotsReq(sid)
-                        finally:
-                            subscribedSymbols.discard(sid)
-            positionsById.clear()
-            positionsById.update(new_positions)
-            # --- the order of rows may change; mark cache dirty once ---
-            H.mark_positions_dirty()
-        
-            # --- refresh PnL + UI if viewer is active ---
-            if liveViewerActive:
-                sendProtoOAGetPositionUnrealizedPnLReq()
-                printLivePnLTable()
-        
-            # --- optional logging for orders ---
-            if res.order:
-#                 print(f"📦 Active Orders ({len(res.order)}):")
-                for order in res.order:
-                    try:
-                        order_id = getattr(order, "orderId", "N/A")
-                        symbol_id = getattr(order, "symbolId", None)
-                        symbol_name = symbolIdToName.get(symbol_id, f"ID:{symbol_id}" if symbol_id else "UNKNOWN")
-                        status = ProtoOAOrderStatus.Name(order.orderStatus) if hasattr(order, "orderStatus") else "UNKNOWN"
-                        print(f" - Order ID: {order_id}, Symbol: {symbol_name}, Status: {status}")
-                    except Exception as e:
-                        print(f"❌ Error displaying order: {e}")
-                        print(f"Raw order object:\n{order}")
-            else:
-                print("📦 No active orders.")
-        
-            reactor.callLater(0.5, sendProtoOATraderReq, accountId)
-    
-    
-    
-
-
-        elif message.payloadType == ProtoOAGetTrendbarsRes().payloadType:
-            res = Protobuf.extract(message)
-            print(f"📉 {len(res.trendbar)} trendbars received.")
-            returnToMenu()
-
-        #
-
-        elif message.payloadType == ProtoOAGetTickDataRes().payloadType:
-            try:
-                res = Protobuf.extract(message)
-        
-                symbolId = getattr(res, "symbolId", None)
-                if symbolId is None:
-                    print("⚠️ TickDataRes missing symbolId; ignoring this response")
-                    return
-        
-                symbolName = symbolIdToName.get(symbolId, f"ID:{symbolId}")
-                pips = symbolIdToPips.get(symbolId, 5)
-        
-                ticks = list(getattr(res, "tickData", []))
-                if not ticks:
-                    print(f"⚠️ No tick data for {symbolName}")
-                    return
-        
-                latest = max(ticks, key=lambda x: getattr(x, "timestamp", 0))
-        
-                # Proto3 presence: treat 0 as “not provided” for bid/ask
-                raw_bid = getattr(latest, "bid", 0)
-                raw_ask = getattr(latest, "ask", 0)
-        
-                bid = (raw_bid / (10 ** pips)) if raw_bid else None
-                ask = (raw_ask / (10 ** pips)) if raw_ask else None
-        
-                if bid is None and ask is None:
-                    print(f"⚠️ Latest tick has no bid/ask for {symbolName}")
-                    return
-                if bid is None:
-                    bid = ask
-                if ask is None:
-                    ask = bid
-        
-                symbolIdToPrice[symbolId] = (bid, ask)
-                print(f"📊 {symbolName} — Tick Price Fallback — Bid: {bid}, Ask: {ask}")
-        
-                if liveViewerActive:
-                    printLivePnLTable()
-        
-            except Exception as e:
-                logging.error("TickData handler error: %s", e)
-                #
-
-        elif message.payloadType == ProtoOAExecutionEvent().payloadType:
-            res = Protobuf.extract(message)
-            try:
-                exec_type = res.executionType
-                print(f"📥 Execution Event: {ProtoOAExecutionType.Name(exec_type)} for Order ID {getattr(res,'orderId','N/A')}")
-        
-                if exec_type == ProtoOAExecutionType.ORDER_FILLED:
-                    print_order_filled_event(res)
-        
-                    if hasattr(res, "position") and res.HasField("position"):
-                        add_position(res.position)
-                        sendProtoOAGetPositionUnrealizedPnLReq()
-                        printLivePnLTable()
-                    else:
-                        runWhenReady(sendProtoOAReconcileReq, currentAccountId)
-                        if hasattr(res, "orderId"):
-                            runWhenReady(sendProtoOAOrderDetailsReq, res.orderId)
-                    return
-        
-                # Other exec types
-                if res.HasField("positionId"):
-                    pos_id = res.positionId
-                else:
-                    pos_id = None
-        
-                close_like = {
-                    ProtoOAExecutionType.CLOSE_POSITION,
-                    ProtoOAExecutionType.ORDER_CANCEL,
-                    ProtoOAExecutionType.DEAL_CANCEL,
-                }
-        
-                if exec_type in close_like and pos_id:
-                    print(f"🗑 Removing position {pos_id} due to {ProtoOAExecutionType.Name(exec_type)}")
-                    remove_position(pos_id)
-                else:
-                    runWhenReady(sendProtoOAReconcileReq, currentAccountId)
-        
-            except Exception as e:
-                log_exec_event_error(res, e)
-
-        elif message.payloadType == 2103:
-            try:
-                res = Protobuf.extract(message)
-                print("📩 Possibly Auth/Execution Response:", res)
-            except Exception:
-                print("⚠️ Could not decode payloadType 2103")
-
-
-        elif message.payloadType == ProtoOATraderRes().payloadType:
-            res = Protobuf.extract(message)
-            trader = res.trader
-            if showStartupOutput:
-                print("📦 Full trader message:\n", trader)
-
-            accountId = trader.ctidTraderAccountId  # ✅ Assign this BEFORE using it
-
-            print(f"✅ Trader info received for {accountId}")
-
-            accountTraderInfo[accountId] = trader  # Save trader info
-
-            if accountId not in accountTraderInfo:
-                accountTraderInfo[accountId] = trader
-
-            if not currentAccountId and accountId in authorizedAccounts and accountId not in pendingReconciliations:
-                currentAccountId = accountId
-                print(f"✅ currentAccountId is now set to: {currentAccountId}")
-
-            print(f"\n💰 Account {accountId}:")
-            print(f" - Balance: {trader.balance / 100:.2f}")
-
-#             if trader.HasField("equity"):
-#                 print(f" - Equity: {trader.equity / 100:.2f}")
-#             else:
-#                 print(" - Equity: [Not available]")
-#             print(f" - Margin Free: {trader.freeMargin / 100:.2f}")
-#             print(f" - Leverage: {trader.leverage}")
-
-            if len(accountTraderInfo) == len(availableAccounts):
-                promptUserToSelectAccount()
-
-        elif message.payloadType == ProtoOADealOffsetListRes().payloadType:
-            res = Protobuf.extract(message)
-            print(f"🧾 Deal Offsets: {len(res.offset)} entries.")
-            returnToMenu()
-
-
-        elif message.payloadType == ProtoOAGetPositionUnrealizedPnLRes().payloadType:
-            res = Protobuf.extract(message)
-
-            # Try both possible protobuf fields
-            money_digits = getattr(res, "moneyDigits", 2)  # fallback to 2
-            unrealized_list = getattr(res, "positionUnrealizedPnL", None)
-
-            if not unrealized_list:
-                print("📦 Full ProtoOAGetPositionUnrealizedPnLRes message (formatted):")
-                print(f"moneyDigits: {money_digits}")
-
-                fallback_list = getattr(res, "unrealizedPnL", None) or getattr(res, "unrealisedPnL", None)
-                if fallback_list:
-                    for pnl in fallback_list:
-                        net_usd = pnl.netUnrealizedPnL / (10 ** money_digits)
-                        gross_usd = pnl.grossUnrealizedPnL / (10 ** money_digits)
-                        print(f" - Position ID: {pnl.positionId:<12} | Gross: ${gross_usd:.2f} | Net: ${net_usd:.2f}")
-            else:
-                total_net_pnl = 0.0
-
-                for pnl in unrealized_list:
-                    try:
-                        # Convert raw values to human-readable dollar amounts
-                        net_usd = pnl.netUnrealizedPnL / (10 ** money_digits)
-                        gross_usd = pnl.grossUnrealizedPnL / (10 ** money_digits)
-                        total_net_pnl += net_usd
-
-
-                        prev = positionPnLById.get(pnl.positionId)
-                        positionPnLById[pnl.positionId] = net_usd
-                        if prev != net_usd:
-                            H.mark_positions_dirty()
-
-                        # Try to show symbol name
-                        pos = positionsById.get(pnl.positionId)
-                        if pos:
-                            symbol_id = pos.tradeData.symbolId
-                            symbol_name = symbolIdToName.get(symbol_id, f"ID:{symbol_id}")
-                        else:
-                            symbol_name = "[unknown]"
-
-
-                        gross_label = H.colorize(gross_usd)
-                        net_label = H.colorize(net_usd)
-
-#                         print(f"📊 Position {pnl.positionId:<12} | Symbol: {symbol_name:<10} | Gross: {gross_label:>10} | Net: {net_label:>10}")
-
-                    except Exception as e:
-                        print(f"❌ Error storing/displaying PnL for position {pnl.positionId}: {e}")
-
-                # ✅ Print the full table ONCE after the loop
-                printLivePnLTable()
-
-                # 💰 Show total net
-                total_label = f"\033[92m${total_net_pnl:.2f}\033[0m" if total_net_pnl > 0 else (
-                              f"\033[91m${total_net_pnl:.2f}\033[0m" if total_net_pnl < 0 else f"${total_net_pnl:.2f}")
-#                 print(f"\n💰 Total Net Unrealized PnL: {total_label}")
-
-                # Move cursor up one line and overwrite
-                print(f"\033[F\033[K💰 Total Net Unrealized PnL: {total_label}")
-
-
-        elif message.payloadType == ProtoOAOrderDetailsRes().payloadType:
-            res = Protobuf.extract(message)
-            print(f"📄 Order Details - ID: {res.order.orderId}, Status: {res.order.orderStatus}")
-            returnToMenu()
-
-        elif message.payloadType == ProtoOAOrderListByPositionIdRes().payloadType:
-            res = Protobuf.extract(message)
-            print(f"📋 Orders in Position: {len(res.order)}")
-            returnToMenu()
-
-
-        elif message.payloadType == 2142:  # ProtoOAErrorRes
-            try:
-                res = ProtoOAErrorRes()
-                res.ParseFromString(message.payload)
-                print(f"❌ ERROR: {res.errorCode} — {res.description}")
-
-                # Optional: stop app if account auth failed
-                if res.errorCode in ["ACCOUNT_NOT_AUTHORIZED", "CH_CTID_TRADER_ACCOUNT_NOT_FOUND"]:
-                    print("🚫 Account authorization failed — please check ACCOUNT_ID in .env or use option 1 to list valid accounts.")
-                    reactor.stop()
-
-            except Exception as e:
-                print(f"❌ Failed to parse error message: {e}")
-                print(f"Payload: {message.payload}")
-            returnToMenu()
-
-        else:
-            print(f"⚠️ Unhandled message — payloadType: {message.payloadType}")
-#             print(f"Raw payload (first 100 bytes): {message.payload[:100]!r}")
-
-
-
-    def onMessageReceived(client, message):
-        if liveViewerActive:
-            with H.suppress_stdout(liveViewerActive):
-                handle_message(client, message)
-        else:
-            handle_message(client, message)
-
 
     accountTraderInfo = {}  # To store info like balance for each account
     availableAccounts = []  # Fetched account IDs
@@ -715,7 +329,6 @@ if __name__ == "__main__":
             authorizedAccounts.add(accountId)
             pendingReconciliations.add(accountId)
             reactor.callLater(0.5, sendProtoOAReconcileReq, accountId)
-#             reactor.callLater(1.0, sendProtoOASymbolsListReq)  # <-- THIS
 
         request = ProtoOAAccountAuthReq()
         request.ctidTraderAccountId = accountId
@@ -814,7 +427,8 @@ if __name__ == "__main__":
 
         def onAccountAuthSuccess(_):
             print("✅ Account authorization successful")
-            sendProtoOAReconcileReq()  # <-- This is essential!
+#             sendProtoOAReconcileReq()  # <-- This is essential!
+            sendProtoOAReconcileReq(currentAccountId)
 
         deferred = client.send(request, clientMsgId=clientMsgId)
         deferred.addCallback(onAccountAuthSuccess)
@@ -888,17 +502,6 @@ if __name__ == "__main__":
         deferred = client.send(request, clientMsgId = clientMsgId)
         deferred.addErrback(onError)
 
-#     def sendProtoOASubscribeSpotsReq(symbolId, timeInSeconds, subscribeToSpotTimestamp	= False, clientMsgId = None):
-#         global client
-#         request = ProtoOASubscribeSpotsReq()
-#         request.ctidTraderAccountId = currentAccountId
-#         request.symbolId.append(int(symbolId))
-#         request.subscribeToSpotTimestamp = subscribeToSpotTimestamp if type(subscribeToSpotTimestamp) is bool else bool(subscribeToSpotTimestamp)
-#         deferred = client.send(request, clientMsgId = clientMsgId)
-#         deferred.addErrback(onError)
-#         reactor.callLater(int(timeInSeconds), sendProtoOAUnsubscribeSpotsReq, symbolId)
-
-    #
 
     def sendProtoOASubscribeSpotsReq(symbolId, timeInSeconds=None, subscribeToSpotTimestamp=False, clientMsgId=None):
         global client
@@ -915,14 +518,6 @@ if __name__ == "__main__":
     
         deferred = client.send(request, clientMsgId=clientMsgId)
         deferred.addErrback(onError)
-        # ✅ Only auto-unsubscribe if timeInSeconds is set
-#         if timeInSeconds:
-#             def unsubscribeAndRemove():
-#                 sendProtoOAUnsubscribeSpotsReq(symbolId)
-#                 subscribedSymbols.discard(symbolId)
-#                 print(f"🔕 Auto-unsubscribed from {symbolId} after {timeInSeconds}s")
-#     
-#             reactor.callLater(int(timeInSeconds), unsubscribeAndRemove)
 
 
     def sendProtoOAReconcileReq(accountId, clientMsgId = None):
@@ -995,7 +590,8 @@ if __name__ == "__main__":
         request = ProtoOAClosePositionReq()
         request.ctidTraderAccountId = currentAccountId
         request.positionId = int(positionId)
-        request.volume = int(volume) * 100
+        # convert lots -> centi-lots with rounding, not truncation
+        request.volume = int(round(float(volume) * 100))
         deferred = client.send(request, clientMsgId = clientMsgId)
         deferred.addErrback(onError)
 
@@ -1015,61 +611,21 @@ if __name__ == "__main__":
         deferred = client.send(request, clientMsgId=clientMsgId)
         deferred.addErrback(onError)
 
+    def waitUntilAllPositionPrices(callback, max_wait=1.0, check_interval=0.1):
+        symbolIds = {pos.tradeData.symbolId for pos in positionsById.values()}
+        attempts = int(max_wait / check_interval)
 
-#     def startPnLUpdateLoop(interval=1.0):
-#         """Continuously poll Unrealized PnL every interval seconds"""
-#         if not currentAccountId or currentAccountId not in authorizedAccounts:
-#             print("⚠️ Cannot start PnL loop – account not ready.")
-#             return
-#
-#         sendProtoOAGetPositionUnrealizedPnLReq()
-#         reactor.callLater(interval, startPnLUpdateLoop, interval)
+        def check(remaining):
+            missing = [sid for sid in symbolIds if sid not in symbolIdToPrice]
+            if not missing:
+                callback()
+            elif remaining <= 0:
+                print("⚠️ Timeout waiting for all spot prices.")
+                callback()
+            else:
+                reactor.callLater(check_interval, check, remaining - 1)
 
-
-
-
-        def waitUntilAllPositionPrices(callback, max_wait=1.0, check_interval=0.1):
-            symbolIds = {pos.tradeData.symbolId for pos in positionsById.values()}
-            attempts = int(max_wait / check_interval)
-    
-            def check(remaining):
-                missing = [sid for sid in symbolIds if sid not in symbolIdToPrice]
-                if not missing:
-                    callback()
-                elif remaining <= 0:
-                    print("⚠️ Timeout waiting for all spot prices.")
-                    callback()
-                else:
-                    reactor.callLater(check_interval, check, remaining - 1)
-    
-            check(attempts)
-   
-        def startViewer():
-            def render():
-                global live
-                sendProtoOAGetPositionUnrealizedPnLReq()
-                reactor.callLater(0.1, printLivePnLTable)
-                startPnLUpdateLoop(0.3)
-                threading.Thread(target=listen_for_keys, daemon=True).start()
-                console.print("\n[dim]🔴 Press 'q' and Enter to exit viewer[/dim]")
-        # 🎯 Render function
-        def render():
-            table, msg = H.buildLivePnLTable()
-            grid = Table.grid(padding=(1, 1))
-            grid.add_row(table)
-            if msg:
-                grid.add_row(f"[red]⚠ {msg}[/red]")
-            return grid
-
-        # create a *global* Live instance (no with-block)
-        live = Live(render(), refresh_per_second=20, screen=True)
-        live.start()
-
-        # fire off background tasks
-        sendProtoOAGetPositionUnrealizedPnLReq()
-        startPnLUpdateLoop(0.3)
-        threading.Thread(target=listen_for_keys, daemon=True).start()
-#         console.print("\n[dim]🔴  q → quit j/k → move ⏎ → details[/dim]")
+        check(attempts)
 
 
     def remove_position(pos_id):
@@ -1081,6 +637,7 @@ if __name__ == "__main__":
     
             positionsById.pop(pos_id, None)
             positionPnLById.pop(pos_id, None)
+
     
             # NEW: if no positions left for this symbol, unsubscribe
             still_used = any(p.tradeData.symbolId == symbol_id for p in positionsById.values())
@@ -1109,9 +666,10 @@ if __name__ == "__main__":
                 view_offset = max(0, selected_position_index - max_rows + 1)
     
             printLivePnLTable()
-
+    #
+    
     def listen_for_keys() -> None:
-        global selected_position_index, liveViewerActive
+        global selected_position_index, liveViewerActive, slInput, slByPositionId
     
         # Prefer the controlling TTY so we don't compete with input()/inputimeout()
         try:
@@ -1150,6 +708,56 @@ if __name__ == "__main__":
                     if not b:
                         continue
                     key = b.decode('utf-8', errors='ignore')
+    
+                    # ----------------- SL input state machine -----------------
+                    if slInput["mode"] == "armed":
+                        if key == "j":
+                            move_selection(+1); continue
+                        if key == "k":
+                            move_selection(-1); continue
+                        if key == "\x1b":  # Esc
+                            slInput.update({"mode": "idle", "positionId": None, "buffer": ""})
+                            reactor.callFromThread(printLivePnLTable); continue
+                        if key in "0123456789.-":
+                            sel = H.safe_current_selection(selected_position_index)
+                            if not sel: 
+                                continue
+                            pid, _ = sel
+                            slInput.update({"mode": "typing", "positionId": pid, "buffer": key})
+                            reactor.callFromThread(printLivePnLTable); continue
+                        # ignore others; fall through to normal keys
+    
+                    elif slInput["mode"] == "typing":
+                        if key in ("\r", "\n"):  # Enter -> save (handle CR and LF)
+                            try:
+                                val = float(slInput["buffer"].strip())
+                                slByPositionId[slInput["positionId"]] = abs(val)
+                            except Exception:
+                                pass
+                            slInput.update({"mode": "idle", "positionId": None, "buffer": ""})
+                            reactor.callFromThread(printLivePnLTable); continue
+                        if key == "\x1b":  # Esc -> cancel
+                            slInput.update({"mode": "idle", "positionId": None, "buffer": ""})
+                            reactor.callFromThread(printLivePnLTable); continue
+                        if key == "\x7f":  # Backspace
+                            slInput["buffer"] = slInput["buffer"][:-1]
+                            reactor.callFromThread(printLivePnLTable); continue
+                        if key in "0123456789.-":
+                            slInput["buffer"] += key
+                            reactor.callFromThread(printLivePnLTable); continue
+                        # while typing we ignore j/k etc, to avoid moving target
+    
+                    # start SL input
+                    if key == "y" and slInput["mode"] == "idle":
+                        sel = H.safe_current_selection(selected_position_index)
+                        if sel:
+                            pid, _ = sel
+                            slInput.update({"mode": "armed", "positionId": pid, "buffer": ""})
+                            reactor.callFromThread(printLivePnLTable)
+                        continue
+                    # -----------------------------------------------------------
+    
+                    # -------- normal hotkeys --------
                     if key == "q":
                         liveViewerActive = False
                         reactor.callFromThread(getattr(live, "stop", lambda: None))
@@ -1175,6 +783,7 @@ if __name__ == "__main__":
                             continue
                         pos_id, pos = sel
                         # show details...
+    
                 except Exception as e:
                     logging.error("Key thread error: %s\n%s", e, traceback.format_exc())
                     # keep the loop alive
@@ -1183,28 +792,11 @@ if __name__ == "__main__":
                 termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
             finally:
                 shutdown.clear_tty_old_settings()
-                # close the dedicated TTY handle if we opened it
                 try:
                     if tty_in is not sys.stdin:
                         tty_in.close()
                 except Exception:
                     pass
-    
-#         def waitForExit():
-#             global selectedPositionIndex
-#             def check_input():
-#                 global liveViewerActive
-#                 while liveViewerActive:
-#                     user_input = sys.stdin.readline().strip().lower()
-#                     if user_input == "q":
-#                         liveViewerActive = False
-#                         live.stop()
-#                         print("👋 Exiting Live PnL Viewer...")
-#                         reactor.callLater(0.5, executeUserCommand)
-#                         break
-#     
-#         waitUntilAllPositionPrices(startViewer)
-#         waitForExit()
     
     def choosePositionFromLiveList():
         choices = []
@@ -1313,8 +905,10 @@ if __name__ == "__main__":
             symbolIdToPrice=symbolIdToPrice,
             positionPnLById=positionPnLById,
             error_messages=error_messages,
+            slByPositionId=slByPositionId,
+            account_currency=get_account_ccy(),
         )
-        live = Live(view, refresh_per_second=20, screen=True)
+        live = Live(view, refresh_per_second=20, screen=True, console=console, auto_refresh=False)
         live.start()
     
         sendProtoOAGetPositionUnrealizedPnLReq()
@@ -1410,6 +1004,81 @@ def runWhenReady(fn, *args, **kwargs):
     def call():
         fn(*args, **kwargs)
     waitUntilAccountReady(currentAccountId, call)
+
+
+def set_current_account_id(val: int) -> None:
+    global currentAccountId
+    currentAccountId = val
+
+
+
+
+ctx = SimpleNamespace(
+    set_current_account_id=set_current_account_id,
+    request_render=_request_render,
+    update_pnl_cache_for_symbol=_update_pnl_cache_for_symbol,
+    # shared state
+    accountMetadata=accountMetadata,
+    pendingReconciliations=pendingReconciliations,
+    symbolIdToName=symbolIdToName,
+    symbolIdToPrice=symbolIdToPrice,
+    symbolIdToPips=symbolIdToPips,
+    subscribedSymbols=subscribedSymbols,
+    expectedSpotSubscriptions=expectedSpotSubscriptions,
+    receivedSpotConfirmations=receivedSpotConfirmations,
+    positionsById=positionsById,
+    positionPnLById=positionPnLById,
+    showStartupOutput=showStartupOutput,
+    liveViewerActive=liveViewerActive,
+    symbolIdToDetails=symbolIdToDetails,
+    currentAccountId=currentAccountId,
+    selected_position_index=selected_position_index,
+    error_messages=error_messages,
+    view_offset=view_offset,
+    slByPositionId=slByPositionId,
+    accountTraderInfo=accountTraderInfo,
+    availableAccounts=availableAccounts,
+    authorizedAccounts=authorizedAccounts,
+    authInProgress=authInProgress,
+    envAccountIds=envAccountIds,
+
+    # functions used by handlers
+    printLivePnLTable=printLivePnLTable,
+    printUpdatedPriceBoard=printUpdatedPriceBoard,
+    returnToMenu=returnToMenu,
+    runWhenReady=runWhenReady,
+    isAccountInitialized=isAccountInitialized,
+    remove_position=remove_position,
+    add_position=add_position,
+    log_exec_event_error=log_exec_event_error,
+    get_account_ccy=get_account_ccy,
+
+    sendProtoOASubscribeSpotsReq=sendProtoOASubscribeSpotsReq,
+    sendProtoOAUnsubscribeSpotsReq=sendProtoOAUnsubscribeSpotsReq,
+    sendProtoOAGetTickDataReq=sendProtoOAGetTickDataReq,
+    sendProtoOAGetPositionUnrealizedPnLReq=sendProtoOAGetPositionUnrealizedPnLReq,
+    sendProtoOAReconcileReq=sendProtoOAReconcileReq,
+    sendProtoOATraderReq=sendProtoOATraderReq,
+    sendProtoOAOrderDetailsReq=sendProtoOAOrderDetailsReq,
+    sendProtoOAClosePositionReq=sendProtoOAClosePositionReq,
+    sendProtoOAGetAccountListByAccessTokenReq=sendProtoOAGetAccountListByAccessTokenReq,
+    fetchTraderInfo=fetchTraderInfo,
+    setAccount=setAccount,
+    promptUserToSelectAccount=promptUserToSelectAccount,
+
+    reactor=reactor,
+
+    # minimal stub used by on_execution handler
+    print_order_filled_event=lambda res: print(f"🟢 Order filled: {getattr(res, 'orderId', '?')}")
+)
+
+
+def onMessageReceived(client, message):
+    if liveViewerActive:
+        with H.suppress_stdout(liveViewerActive):
+            dispatch_message(client, message, ctx)
+    else:
+        dispatch_message(client, message, ctx)
 
 
 def executeUserCommand():
